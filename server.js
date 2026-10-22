@@ -41,10 +41,19 @@ const MIN_AZN = { card: 3, google: 20, apple: 20 };
 // Pay4bit-in MÜŞTƏRİDƏN tutduğu komissiya faizi (üsul üzrə). Pay4bit kabinetindəki real faizi bura yaz!
 // Məsələn kart 5% tutursa -> card: 5. Server müştərinin ÜMUMİ ödənişi (məbləğ + komissiya)
 // yazdığı məbləğə (məs. 20 AZN) bərabər olsun deyə Pay4bit-ə göndərilən məbləği avtomatik azaldır.
+// Pay4bit səhifəsində 10.00 EUR üçün 3.54 EUR komissiya göstərildi -> 35.4% (Google Pay).
+// Apple Pay üçün eyni götürülüb. Kart üçün real faiz ölçülməyib -> 0 (ölçəndən sonra yaz).
+// Render-də PAY4BIT_COMM_* mühit dəyişənləri ilə də dəyişmək olar.
 const COMMISSION_PERCENT = {
   card:   Number(process.env.PAY4BIT_COMM_CARD   || 0),
-  google: Number(process.env.PAY4BIT_COMM_GOOGLE || 0),
-  apple:  Number(process.env.PAY4BIT_COMM_APPLE  || 0)
+  google: Number(process.env.PAY4BIT_COMM_GOOGLE || 35.4),
+  apple:  Number(process.env.PAY4BIT_COMM_APPLE  || 35.4)
+};
+// Əgər Pay4bit faizlə yanaşı SABİT komissiya da tutursa (EUR), bura yaz. Yoxdursa 0 qalsın.
+const COMMISSION_FIXED_EUR = {
+  card:   Number(process.env.PAY4BIT_FIX_CARD   || 0),
+  google: Number(process.env.PAY4BIT_FIX_GOOGLE || 0),
+  apple:  Number(process.env.PAY4BIT_FIX_APPLE  || 0)
 };
 const MAX_AZN = 2000;
 const MIN_CHARGE = 1; // Pay4bit minimumu 1 EUR
@@ -125,9 +134,9 @@ async function getAznPerEur() {
 }
 // azn = müştərinin ödəyəcəyi ÜMUMİ məbləğ (komissiya daxil). Pay4bit komissiyanı üstünə əlavə etdiyi üçün
 // göndərilən məbləğ = ümumi / (1 + komissiya%). Aşağı yuvarlaqlanır ki, müştəri heç vaxt artıq ödəməsin.
-function aznToEur(azn, aznPerEur, commissionPercent) {
-  const eurTotal = azn / aznPerEur;
-  const eurSend = eurTotal / (1 + (commissionPercent || 0) / 100);
+function aznToEur(azn, aznPerEur, commissionPercent, fixedEur) {
+  const eurTotal = azn / aznPerEur;                       // müştərinin ödəyəcəyi ÜMUMİ məbləğ (EUR)
+  const eurSend = (eurTotal - (fixedEur || 0)) / (1 + (commissionPercent || 0) / 100);
   return (Math.floor(eurSend * 100 + 1e-9) / 100).toFixed(2);
 }
 
@@ -170,7 +179,10 @@ app.post('/create-payment', authUser, async (req, res) => {
 
     const { aznPerEur, source } = await getAznPerEur();
     const commission = COMMISSION_PERCENT[method] || 0;
-    const amount = aznToEur(azn, aznPerEur, commission);
+    const fixedFee = COMMISSION_FIXED_EUR[method] || 0;
+    const amount = aznToEur(azn, aznPerEur, commission, fixedFee);
+    const payerTotalEur = (Number(amount) * (1 + commission / 100) + fixedFee).toFixed(2); // Pay4bit səhifəsində görünəcək ümumi
+    console.log(`[create-payment] ${method} ${azn} AZN | kurs ${aznPerEur} | komissiya ${commission}%+${fixedFee} EUR | Pay4bit-ə gedən ${amount} EUR | müştəri səhifədə görəcək ≈ ${payerTotalEur} EUR (hədəf ${(azn / aznPerEur).toFixed(2)} EUR)`);
     if (Number(amount) < MIN_CHARGE) {
       return res.status(400).json({ success: false, error: 'Məbləğ Pay4bit minimumundan (1 EUR) azdır' });
     }
@@ -182,7 +194,8 @@ app.post('/create-payment', authUser, async (req, res) => {
 
     await db.collection('payments').doc(orderId).set({
       uid: req.user.uid, method, status: 'pending',
-      purpose: 'code', platform: 'fastloto', commissionPercent: commission,
+      purpose: 'code', platform: 'fastloto', commissionPercent: commission, commissionFixedEur: fixedFee,
+      payerTotalEur,
       aznAmount: azn, chargeAmount: amount, chargeCurrency: CHARGE_CURRENCY,
       aznPerEur, rateSource: source, desc, createdAt: FieldValue.serverTimestamp()
     });
