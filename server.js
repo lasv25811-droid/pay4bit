@@ -37,14 +37,23 @@ const MIN_AZN = { card: 3, google: 3, apple: 3 };
 const MAX_AZN = 2000;
 const MIN_CHARGE = 1; // Pay4bit minimumu 1 EUR
 
-const SA = process.env.FIREBASE_SERVICE_ACCOUNT ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT) : FIREBASE_SA;
-if (!SA) {
-  console.error('Firebase service account əlavə olunmayıb! server.js-də FIREBASE_SA sətrinə JSON yapışdır.');
+let SA = null;
+try {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_B64
+    ? Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8')
+    : process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (raw && raw.trim()) SA = JSON.parse(raw.trim());
+} catch (e) {
+  console.error('FIREBASE_SERVICE_ACCOUNT JSON kimi oxunmadı:', e.message);
+}
+if (!SA) SA = FIREBASE_SA;
+if (!SA || !SA.private_key || !SA.client_email) {
+  console.error('Firebase service account tapılmadı və ya natamamdır (private_key / client_email yoxdur).');
   process.exit(1);
 }
+SA.private_key = String(SA.private_key).replace(/\\n/g, '\n');
+console.log('Firebase service account yükləndi:', SA.project_id, SA.client_email);
 
-// ---------- Firebase Admin ----------
-// FIREBASE_SERVICE_ACCOUNT = service account JSON-un tam mətni
 admin.initializeApp({ credential: admin.credential.cert(SA) });
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
