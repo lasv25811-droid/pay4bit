@@ -1,10 +1,13 @@
 /**
- * YevroLato – Pay4bit backend
+ * YevroLato – Pay4bit backend (FASTLOTO KOD AL)
  * Axın:
- *  1) Frontend  -> POST /create-payment  (Firebase ID token + AZN məbləğ + üsul)
- *  2) Server    -> aktiv məzənnə (CBAR) ilə AZN -> EUR çevirir, sifariş yaradır, imzalı Pay4bit linki qaytarır
+ *  1) Frontend  -> POST /create-payment  (Firebase ID token + AZN kod məbləği + üsul)
+ *  2) Server    -> aktiv məzənnə (CBAR) ilə AZN -> EUR çevirir, Pay4bit komissiyasını məbləğin İÇİNDƏ saxlayır
+ *                  (müştəri komissiya daxil ÜMUMİ olaraq yazdığı məbləği ödəyir), imzalı Pay4bit linki qaytarır
  *  3) İstifadəçi Pay4bit-də ödəyir (kart / Google Pay / Apple Pay)
- *  4) Pay4bit   -> /pay4bit/callback (CHECK -> PAY) ; server imzanı + məbləği yoxlayıb balansı artırır
+ *  4) Pay4bit   -> /pay4bit/callback (CHECK -> PAY) ; server imzanı + məbləği yoxlayır,
+ *                  hovuzdan həmin məbləğdə kodu müştəriyə verir (yoxdursa adminə kod tələbi yaradır).
+ *                  Sayt balansı artırılmır.
  * Secret key YALNIZ bu serverdə qalır, brauzerə heç vaxt getmir.
  */
 const express = require('express');
@@ -24,7 +27,6 @@ const FIREBASE_SA = null;
 // =======================================
 const PAY4BIT_URL = 'https://api.pay4bit.net/pay';
 const CHARGE_CURRENCY = 'EUR';                       // Pay4bit default valyutası
-const FX_MARGIN_PERCENT = Number(process.env.FX_MARGIN_PERCENT || 0); // istəsən +% əlavə et
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Pay4bit paySystem dəyərləri (boşdursa Pay4bit öz seçim səhifəsini göstərir – ən təhlükəsiz variant)
@@ -33,7 +35,17 @@ const PAY_SYSTEM = {
   google: process.env.PAY4BIT_GOOGLE_PS || '',
   apple:  process.env.PAY4BIT_APPLE_PS  || ''
 };
-const MIN_AZN = { card: 3, google: 3, apple: 3 };
+// Minimum məbləğlər (AZN): kart 3, Google Pay 20, Apple Pay 20
+const MIN_AZN = { card: 3, google: 20, apple: 20 };
+
+// Pay4bit-in MÜŞTƏRİDƏN tutduğu komissiya faizi (üsul üzrə). Pay4bit kabinetindəki real faizi bura yaz!
+// Məsələn kart 5% tutursa -> card: 5. Server müştərinin ÜMUMİ ödənişi (məbləğ + komissiya)
+// yazdığı məbləğə (məs. 20 AZN) bərabər olsun deyə Pay4bit-ə göndərilən məbləği avtomatik azaldır.
+const COMMISSION_PERCENT = {
+  card:   Number(process.env.PAY4BIT_COMM_CARD   || 0),
+  google: Number(process.env.PAY4BIT_COMM_GOOGLE || 0),
+  apple:  Number(process.env.PAY4BIT_COMM_APPLE  || 0)
+};
 const MAX_AZN = 2000;
 const MIN_CHARGE = 1; // Pay4bit minimumu 1 EUR
 
@@ -111,9 +123,12 @@ async function getAznPerEur() {
   }
   return rateCache;
 }
-function aznToEur(azn, aznPerEur) {
-  const eur = (azn / aznPerEur) * (1 + FX_MARGIN_PERCENT / 100);
-  return (Math.ceil(eur * 100) / 100).toFixed(2); // yuxarı yuvarlaqla, 2 rəqəm
+// azn = müştərinin ödəyəcəyi ÜMUMİ məbləğ (komissiya daxil). Pay4bit komissiyanı üstünə əlavə etdiyi üçün
+// göndərilən məbləğ = ümumi / (1 + komissiya%). Aşağı yuvarlaqlanır ki, müştəri heç vaxt artıq ödəməsin.
+function aznToEur(azn, aznPerEur, commissionPercent) {
+  const eurTotal = azn / aznPerEur;
+  const eurSend = eurTotal / (1 + (commissionPercent || 0) / 100);
+  return (Math.floor(eurSend * 100 + 1e-9) / 100).toFixed(2);
 }
 
 // ---------- Köməkçilər ----------
@@ -154,18 +169,20 @@ app.post('/create-payment', authUser, async (req, res) => {
     if (azn > MAX_AZN) return res.status(400).json({ success: false, error: `Maksimum ${MAX_AZN} AZN` });
 
     const { aznPerEur, source } = await getAznPerEur();
-    const amount = aznToEur(azn, aznPerEur);
+    const commission = COMMISSION_PERCENT[method] || 0;
+    const amount = aznToEur(azn, aznPerEur, commission);
     if (Number(amount) < MIN_CHARGE) {
       return res.status(400).json({ success: false, error: 'Məbləğ Pay4bit minimumundan (1 EUR) azdır' });
     }
 
     const orderId = Date.now().toString(36) + crypto.randomBytes(4).toString('hex');
     const account = orderId;
-    const desc = `YevroLato depozit ${orderId}`;
+    const desc = `YevroLato FASTLOTO kod ${orderId}`;
     const sign = sha256(desc + account + amount + SECRET_KEY);   // check_sign
 
     await db.collection('payments').doc(orderId).set({
       uid: req.user.uid, method, status: 'pending',
+      purpose: 'code', platform: 'fastloto', commissionPercent: commission,
       aznAmount: azn, chargeAmount: amount, chargeCurrency: CHARGE_CURRENCY,
       aznPerEur, rateSource: source, desc, createdAt: FieldValue.serverTimestamp()
     });
@@ -189,7 +206,12 @@ app.get('/payment-status', authUser, async (req, res) => {
   const snap = await db.collection('payments').doc(String(req.query.order || '')).get();
   if (!snap.exists || snap.data().uid !== req.user.uid) return res.status(404).json({ success: false });
   const d = snap.data();
-  res.json({ success: true, status: d.status, azn: d.aznAmount });
+  res.json({
+    success: true, status: d.status, azn: d.aznAmount,
+    codeStatus: d.codeStatus || null,            // 'delivered' | 'admin_pending'
+    code: d.codeStatus === 'delivered' ? d.code : null,
+    codeRequestId: d.codeRequestId || null
+  });
 });
 
 // ---------- Pay4bit callback (CHECK / PAY / ERROR) ----------
@@ -227,22 +249,57 @@ async function pay4bitCallback(req, res) {
 
     if (method === 'pay') {
       await db.runTransaction(async tx => {
+        // ---- bütün oxumalar əvvəl ----
         const cur = await tx.get(ref);
-        if (cur.data().status === 'paid') return;              // təkrar PAY -> yenidən əlavə etmə
+        if (cur.data().status === 'paid') return;              // təkrar PAY -> kodu ikinci dəfə vermə
         const userRef = db.collection('users').doc(order.uid);
+        const userSnap = await tx.get(userRef);
+        const u = userSnap.exists ? userSnap.data() : {};
+        const poolQ = db.collection('fastlotoCodes')
+          .where('amount', '==', order.aznAmount).where('status', '==', 'available').limit(1);
+        const poolSnap = await tx.get(poolQ);
+
+        // ---- yazmalar ----
+        const platform = order.platform || 'fastloto';
+        const payUpdate = {
+          status: 'paid', localpayId: String(p.localpayId || ''),
+          paymentType: String(p.paymentType || ''), paidAt: FieldValue.serverTimestamp()
+        };
+        // balans artırılmır; yalnız xal və çarx hüququ (əvvəlki kimi)
         tx.update(userRef, {
-          balance: FieldValue.increment(order.aznAmount),
           points: FieldValue.increment(order.aznAmount),       // 1 AZN = 1 xal
           payWheelSpins: FieldValue.increment(1)
         });
-        tx.set(userRef.collection('history').doc(), {
-          type: 'deposit', amount: order.aznAmount,
-          description: `Pay4bit (${order.method}) depozit`, createdAt: FieldValue.serverTimestamp()
-        });
-        tx.update(ref, {
-          status: 'paid', localpayId: String(p.localpayId || ''),
-          paymentType: String(p.paymentType || ''), paidAt: FieldValue.serverTimestamp()
-        });
+
+        if (!poolSnap.empty) {
+          // Hovuzda kod var -> avtomatik təhvil
+          const poolDoc = poolSnap.docs[0];
+          const codeStr = poolDoc.data().code;
+          tx.update(poolDoc.ref, {
+            status: 'used', usedByUid: order.uid,
+            usedByUniqueId: u.uniqueId || '', usedAt: FieldValue.serverTimestamp()
+          });
+          tx.set(userRef.collection('codes').doc('pay_' + account), {
+            code: codeStr, platform, amount: order.aznAmount, source: 'pool',
+            status: 'active', createdAt: FieldValue.serverTimestamp()
+          });
+          tx.set(userRef.collection('history').doc('pay_' + account), {
+            type: 'withdraw', amount: -order.aznAmount,
+            description: platform.toUpperCase() + ' Kod Alışı (Pay4bit)', createdAt: FieldValue.serverTimestamp()
+          });
+          payUpdate.codeStatus = 'delivered';
+          payUpdate.code = codeStr;
+        } else {
+          // Hovuzda yoxdur -> adminə (ödənilmiş) kod tələbi
+          tx.set(db.collection('codeRequests').doc(account), {
+            uid: order.uid, userName: u.displayName || '', userUniqueId: u.uniqueId || '',
+            platform, amount: order.aznAmount, status: 'pending', code: '',
+            paid: true, orderId: account, createdAt: FieldValue.serverTimestamp()
+          });
+          payUpdate.codeStatus = 'admin_pending';
+          payUpdate.codeRequestId = account;
+        }
+        tx.update(ref, payUpdate);
       });
       return reply('Request successfully processed');
     }
