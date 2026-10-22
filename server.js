@@ -3,7 +3,7 @@
  * Axın:
  *  1) Frontend  -> POST /create-payment  (Firebase ID token + AZN kod məbləği + üsul)
  *  2) Server    -> aktiv məzənnə (CBAR) ilə AZN -> EUR çevirir, Pay4bit komissiyasını məbləğin İÇİNDƏ saxlayır
- *                  (müştəri komissiya daxil ÜMUMİ olaraq yazdığı məbləği ödəyir), imzalı Pay4bit linki qaytarır
+ *                  (müştəri komissiya daxil ÜMUMİ olaraq yazdığı AZN-in avro qarşılığını ödəyir), imzalı Pay4bit linki qaytarır
  *  3) İstifadəçi Pay4bit-də ödəyir (kart / Google Pay / Apple Pay)
  *  4) Pay4bit   -> /pay4bit/callback (CHECK -> PAY) ; server imzanı + məbləği yoxlayır,
  *                  hovuzdan həmin məbləğdə kodu müştəriyə verir (yoxdursa adminə kod tələbi yaradır).
@@ -16,44 +16,43 @@ const cors = require('cors');
 const path = require('path');
 const admin = require('firebase-admin');
 
-// ---------- Konfiqurasiya (Environment dəyişənləri) ----------
-// ====== AYARLAR (birbaşa burada) ======
+// ---------- Konfiqurasiya ----------
 const PUBLIC_KEY = process.env.PAY4BIT_PUBLIC_KEY || '36cf4-712';
 const SECRET_KEY = process.env.PAY4BIT_SECRET_KEY || 'd868aee241455e82f6d3a99cb3283d73';
 
-// Firebase Console -> Project settings -> Service accounts -> Generate new private key
-// Endirilən .json faylının BÜTÜN məzmununu null yerinə yapışdır: const FIREBASE_SA = { "type": "service_account", ... };
+// Firebase service account (null qalsa mühit dəyişənindən oxunur)
 const FIREBASE_SA = null;
 // =======================================
 const PAY4BIT_URL = 'https://api.pay4bit.net/pay';
-const CHARGE_CURRENCY = 'EUR';                       // Pay4bit default valyutası
+const CHARGE_CURRENCY = 'EUR';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
-// Pay4bit paySystem dəyərləri (boşdursa Pay4bit öz seçim səhifəsini göstərir – ən təhlükəsiz variant)
 const PAY_SYSTEM = {
   card:   process.env.PAY4BIT_CARD_PS   || '',
   google: process.env.PAY4BIT_GOOGLE_PS || '',
   apple:  process.env.PAY4BIT_APPLE_PS  || ''
 };
-// Minimum məbləğlər (AZN): kart 3, Google Pay 20, Apple Pay 20
+// Minimum məbləğlər (AZN)
 const MIN_AZN = { card: 3, google: 20, apple: 20 };
 
-// Pay4bit-in MÜŞTƏRİDƏN tutduğu komissiya faizi (üsul üzrə). Pay4bit kabinetindəki real faizi bura yaz!
-// Məsələn kart 5% tutursa -> card: 5. Server müştərinin ÜMUMİ ödənişi (məbləğ + komissiya)
-// yazdığı məbləğə (məs. 20 AZN) bərabər olsun deyə Pay4bit-ə göndərilən məbləği avtomatik azaldır.
-// Pay4bit səhifəsində 10.00 EUR üçün 3.54 EUR komissiya göstərildi -> 35.4% (Google Pay).
-// Apple Pay üçün eyni götürülüb. Kart üçün real faiz ölçülməyib -> 0 (ölçəndən sonra yaz).
-// Render-də PAY4BIT_COMM_* mühit dəyişənləri ilə də dəyişmək olar.
+/**
+ * Pay4bit ödəniş səhifəsində müştərinin ödəyəcəyi ümumi məbləğ:
+ *     ümumi = göndərilən * (1 + faiz/100) + sabit
+ * Ölçmə (Google Pay): göndərilən 7.32 € -> 11.17 €, göndərilən 14.65 € -> 19.83 €
+ *     => faiz ≈ 18.14 %, sabit ≈ 2.52 €
+ * Server tərsini hesablayır: göndərilən = (hədəf - sabit) / (1 + faiz/100)
+ * Beləliklə səhifədə həmişə yazılan AZN-in avro qarşılığı görünür.
+ * Kart üçün komissiya ölçülməyib -> 0 (ölçəndən sonra Render env ilə yaz).
+ */
 const COMMISSION_PERCENT = {
   card:   Number(process.env.PAY4BIT_COMM_CARD   || 0),
-  google: Number(process.env.PAY4BIT_COMM_GOOGLE || 35.4),
-  apple:  Number(process.env.PAY4BIT_COMM_APPLE  || 35.4)
+  google: Number(process.env.PAY4BIT_COMM_GOOGLE || 18.14),
+  apple:  Number(process.env.PAY4BIT_COMM_APPLE  || 18.14)
 };
-// Əgər Pay4bit faizlə yanaşı SABİT komissiya da tutursa (EUR), bura yaz. Yoxdursa 0 qalsın.
 const COMMISSION_FIXED_EUR = {
   card:   Number(process.env.PAY4BIT_FIX_CARD   || 0),
-  google: Number(process.env.PAY4BIT_FIX_GOOGLE || 0),
-  apple:  Number(process.env.PAY4BIT_FIX_APPLE  || 0)
+  google: Number(process.env.PAY4BIT_FIX_GOOGLE || 2.52),
+  apple:  Number(process.env.PAY4BIT_FIX_APPLE  || 2.52)
 };
 const MAX_AZN = 2000;
 const MIN_CHARGE = 1; // Pay4bit minimumu 1 EUR
@@ -126,18 +125,23 @@ async function getAznPerEur() {
   catch (e1) {
     try { rateCache = { aznPerEur: await fetchBackupEur(), at: Date.now(), source: 'er-api' }; }
     catch (e2) {
-      if (rateCache.aznPerEur) return rateCache;       // köhnə keş (son çarə)
+      if (rateCache.aznPerEur) return rateCache;
       throw new Error('Məzənnə əldə edilə bilmədi');
     }
   }
   return rateCache;
 }
-// azn = müştərinin ödəyəcəyi ÜMUMİ məbləğ (komissiya daxil). Pay4bit komissiyanı üstünə əlavə etdiyi üçün
-// göndərilən məbləğ = ümumi / (1 + komissiya%). Aşağı yuvarlaqlanır ki, müştəri heç vaxt artıq ödəməsin.
+
+// azn = müştərinin ödəməli olduğu ümumi məbləğ (AZN). Hədəf avro = azn / kurs.
+// Pay4bit göndərilənin üstünə faiz + sabit əlavə etdiyi üçün göndərilən məbləğ tərsinə hesablanır.
+// Ən yaxın sentə yuvarlaqlanır ki, səhifədə görünən məbləğ hədəfə maksimum yaxın olsun.
 function aznToEur(azn, aznPerEur, commissionPercent, fixedEur) {
-  const eurTotal = azn / aznPerEur;                       // müştərinin ödəyəcəyi ÜMUMİ məbləğ (EUR)
-  const eurSend = (eurTotal - (fixedEur || 0)) / (1 + (commissionPercent || 0) / 100);
-  return (Math.floor(eurSend * 100 + 1e-9) / 100).toFixed(2);
+  const target = azn / aznPerEur;
+  const send = (target - (fixedEur || 0)) / (1 + (commissionPercent || 0) / 100);
+  return (Math.round(send * 100) / 100).toFixed(2);
+}
+function payerTotal(sendEur, commissionPercent, fixedEur) {
+  return (Number(sendEur) * (1 + (commissionPercent || 0) / 100) + (fixedEur || 0)).toFixed(2);
 }
 
 // ---------- Köməkçilər ----------
@@ -181,8 +185,8 @@ app.post('/create-payment', authUser, async (req, res) => {
     const commission = COMMISSION_PERCENT[method] || 0;
     const fixedFee = COMMISSION_FIXED_EUR[method] || 0;
     const amount = aznToEur(azn, aznPerEur, commission, fixedFee);
-    const payerTotalEur = (Number(amount) * (1 + commission / 100) + fixedFee).toFixed(2); // Pay4bit səhifəsində görünəcək ümumi
-    console.log(`[create-payment] ${method} ${azn} AZN | kurs ${aznPerEur} | komissiya ${commission}%+${fixedFee} EUR | Pay4bit-ə gedən ${amount} EUR | müştəri səhifədə görəcək ≈ ${payerTotalEur} EUR (hədəf ${(azn / aznPerEur).toFixed(2)} EUR)`);
+    const payerTotalEur = payerTotal(amount, commission, fixedFee);
+    console.log(`[create-payment] ${method} ${azn} AZN | kurs ${aznPerEur} | komissiya ${commission}%+${fixedFee} EUR | Pay4bit-ə gedən ${amount} EUR | səhifədə görünəcək ≈ ${payerTotalEur} EUR (hədəf ${(azn / aznPerEur).toFixed(2)} EUR)`);
     if (Number(amount) < MIN_CHARGE) {
       return res.status(400).json({ success: false, error: 'Məbləğ Pay4bit minimumundan (1 EUR) azdır' });
     }
@@ -238,7 +242,6 @@ async function pay4bitCallback(req, res) {
     const amount = String(p.amount || '');
     const desc = String(p.desc || '');
 
-    // İmza yoxlaması (ikisindən biri düzgün olmalıdır; hər ikisi secret key tələb edir)
     const okCheck = p.check_sign && safeEq(sha256(desc + account + amount + SECRET_KEY), p.check_sign);
     const okSign = p.sign && p.localpayId && safeEq(md5(String(p.localpayId) + account + String(p.sum) + SECRET_KEY), p.sign);
     if (!okCheck && !okSign) { console.warn('[callback] imza səhvdir', account); return reply('Invalid signature', 400); }
@@ -278,14 +281,12 @@ async function pay4bitCallback(req, res) {
           status: 'paid', localpayId: String(p.localpayId || ''),
           paymentType: String(p.paymentType || ''), paidAt: FieldValue.serverTimestamp()
         };
-        // balans artırılmır; yalnız xal və çarx hüququ (əvvəlki kimi)
         tx.update(userRef, {
           points: FieldValue.increment(order.aznAmount),       // 1 AZN = 1 xal
           payWheelSpins: FieldValue.increment(1)
         });
 
         if (!poolSnap.empty) {
-          // Hovuzda kod var -> avtomatik təhvil
           const poolDoc = poolSnap.docs[0];
           const codeStr = poolDoc.data().code;
           tx.update(poolDoc.ref, {
@@ -303,7 +304,6 @@ async function pay4bitCallback(req, res) {
           payUpdate.codeStatus = 'delivered';
           payUpdate.code = codeStr;
         } else {
-          // Hovuzda yoxdur -> adminə (ödənilmiş) kod tələbi
           tx.set(db.collection('codeRequests').doc(account), {
             uid: order.uid, userName: u.displayName || '', userUniqueId: u.uniqueId || '',
             platform, amount: order.aznAmount, status: 'pending', code: '',
