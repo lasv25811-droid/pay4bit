@@ -6,8 +6,10 @@
  *                  (müştəri komissiya daxil ÜMUMİ olaraq yazdığı AZN-in avro qarşılığını ödəyir), imzalı Pay4bit linki qaytarır
  *  3) İstifadəçi Pay4bit-də ödəyir (kart / Google Pay / Apple Pay)
  *  4) Pay4bit   -> /pay4bit/callback (CHECK -> PAY) ; server imzanı + məbləği yoxlayır,
- *                  hovuzdan həmin məbləğdə kodu müştəriyə verir (yoxdursa adminə kod tələbi yaradır).
- *                  Sayt balansı artırılmır.
+ *                  purpose='deposit' -> sayt balansı AVTOMATİK artırılır (+ xal, + PayÇarx fırlatması, ilk depozit 2x bonusu)
+ *                  purpose='code'    -> admin panelindəki kod hovuzundan (fastlotoCodes) həmin məbləğdə kod verilir
+ *                                       (hovuzda yoxdursa adminə kod tələbi yaradılır). Balans artırılmır.
+ *                  Uğurlu ödənişlər 'payments' kolleksiyasında qalır -> admin paneldə 'Pay4bit Depozitlər' bölməsi.
  * Secret key YALNIZ bu serverdə qalır, brauzerə heç vaxt getmir.
  */
 const express = require('express');
@@ -173,6 +175,8 @@ app.get('/rate', async (req, res) => {
 app.post('/create-payment', authUser, async (req, res) => {
   try {
     const method = String(req.body.method || '');
+    const purpose = req.body.purpose === 'deposit' ? 'deposit' : 'code';
+    const platform = req.body.platform === 'chcplay' ? 'chcplay' : 'fastloto';
     if (!(method in MIN_AZN)) return res.status(400).json({ success: false, error: 'Yanlış ödəniş üsulu' });
 
     const raw = String(req.body.amount ?? '').trim().replace(',', '.');
@@ -193,12 +197,18 @@ app.post('/create-payment', authUser, async (req, res) => {
 
     const orderId = Date.now().toString(36) + crypto.randomBytes(4).toString('hex');
     const account = orderId;
-    const desc = `YevroLato FASTLOTO kod ${orderId}`;
+    const desc = purpose === 'deposit' ? `YevroLato depozit ${orderId}` : `YevroLato FASTLOTO kod ${orderId}`;
     const sign = sha256(desc + account + amount + SECRET_KEY);   // check_sign
 
+    let uName = '', uUnique = '';
+    try {
+      const us = await db.collection('users').doc(req.user.uid).get();
+      if (us.exists) { uName = us.data().displayName || ''; uUnique = us.data().uniqueId || ''; }
+    } catch (_) {}
+
     await db.collection('payments').doc(orderId).set({
-      uid: req.user.uid, method, status: 'pending',
-      purpose: 'code', platform: 'fastloto', commissionPercent: commission, commissionFixedEur: fixedFee,
+      uid: req.user.uid, userName: uName, userUniqueId: uUnique, method, status: 'pending',
+      purpose, platform, commissionPercent: commission, commissionFixedEur: fixedFee,
       payerTotalEur,
       aznAmount: azn, chargeAmount: amount, chargeCurrency: CHARGE_CURRENCY,
       aznPerEur, rateSource: source, desc, createdAt: FieldValue.serverTimestamp()
@@ -208,7 +218,7 @@ app.post('/create-payment', authUser, async (req, res) => {
     if (PAY_SYSTEM[method]) params.paySystem = PAY_SYSTEM[method];
 
     res.json({
-      success: true, orderId,
+      success: true, orderId, purpose,
       azn, charge: amount, currency: CHARGE_CURRENCY, aznPerEur,
       redirect_url: `${PAY4BIT_URL}?${new URLSearchParams(params).toString()}`
     });
@@ -225,6 +235,7 @@ app.get('/payment-status', authUser, async (req, res) => {
   const d = snap.data();
   res.json({
     success: true, status: d.status, azn: d.aznAmount,
+    purpose: d.purpose || 'code', bonus: d.bonus || 0,
     codeStatus: d.codeStatus || null,            // 'delivered' | 'admin_pending'
     code: d.codeStatus === 'delivered' ? d.code : null,
     codeRequestId: d.codeRequestId || null
@@ -251,8 +262,11 @@ async function pay4bitCallback(req, res) {
     if (!snap.exists) return reply('Order not found', 404);
     const order = snap.data();
 
-    if (Number(amount).toFixed(2) !== order.chargeAmount || String(p.currency).toUpperCase() !== order.chargeCurrency) {
-      console.warn('[callback] məbləğ uyğunsuzluğu', account, amount, p.currency);
+    // İmzalanmış məbləği yoxla (check_sign -> amount, sign -> sum). Valyuta yalnız göndərilibsə yoxlanılır.
+    const signedAmount = okCheck ? amount : String(p.sum || '');
+    const curr = String(p.currency || '').toUpperCase();
+    if (Number(signedAmount).toFixed(2) !== order.chargeAmount || (curr && curr !== order.chargeCurrency)) {
+      console.warn('[callback] məbləğ uyğunsuzluğu', account, signedAmount, p.currency);
       return reply('Amount mismatch', 400);
     }
 
@@ -264,56 +278,85 @@ async function pay4bitCallback(req, res) {
     }
 
     if (method === 'pay') {
+      const round2 = n => Math.round(n * 100) / 100;
       await db.runTransaction(async tx => {
         // ---- bütün oxumalar əvvəl ----
         const cur = await tx.get(ref);
-        if (cur.data().status === 'paid') return;              // təkrar PAY -> kodu ikinci dəfə vermə
+        if (cur.data().status === 'paid') return;              // təkrar PAY -> ikinci dəfə balans/kod vermə
+        const purpose = order.purpose === 'deposit' ? 'deposit' : 'code';
         const userRef = db.collection('users').doc(order.uid);
         const userSnap = await tx.get(userRef);
         const u = userSnap.exists ? userSnap.data() : {};
-        const poolQ = db.collection('fastlotoCodes')
-          .where('amount', '==', order.aznAmount).where('status', '==', 'available').limit(1);
-        const poolSnap = await tx.get(poolQ);
+        let poolSnap = null;
+        if (purpose === 'code') {
+          poolSnap = await tx.get(db.collection('fastlotoCodes')
+            .where('amount', '==', order.aznAmount).where('status', '==', 'available').limit(1));
+        }
 
         // ---- yazmalar ----
         const platform = order.platform || 'fastloto';
+        const bonus = (u.firstDepositBonus === 'pending') ? round2(order.aznAmount) : 0;   // PayÇarx: ilk depozit 2x
         const payUpdate = {
-          status: 'paid', localpayId: String(p.localpayId || ''),
+          status: 'paid', purpose, bonus, userName: u.displayName || order.userName || '',
+          userUniqueId: u.uniqueId || order.userUniqueId || '',
+          localpayId: String(p.localpayId || ''),
           paymentType: String(p.paymentType || ''), paidAt: FieldValue.serverTimestamp()
         };
-        tx.update(userRef, {
+
+        const userUpd = {
           points: FieldValue.increment(order.aznAmount),       // 1 AZN = 1 xal
           payWheelSpins: FieldValue.increment(1)
-        });
+        };
+        let balanceAdd = 0;
+        if (purpose === 'deposit') balanceAdd += order.aznAmount;
+        if (bonus > 0) { balanceAdd += bonus; userUpd.firstDepositBonus = 'used'; }
+        if (balanceAdd > 0) userUpd.balance = FieldValue.increment(round2(balanceAdd));
+        tx.update(userRef, userUpd);
 
-        if (!poolSnap.empty) {
-          const poolDoc = poolSnap.docs[0];
-          const codeStr = poolDoc.data().code;
-          tx.update(poolDoc.ref, {
-            status: 'used', usedByUid: order.uid,
-            usedByUniqueId: u.uniqueId || '', usedAt: FieldValue.serverTimestamp()
-          });
-          tx.set(userRef.collection('codes').doc('pay_' + account), {
-            code: codeStr, platform, amount: order.aznAmount, source: 'pool',
-            status: 'active', createdAt: FieldValue.serverTimestamp()
-          });
+        if (purpose === 'deposit') {
           tx.set(userRef.collection('history').doc('pay_' + account), {
-            type: 'withdraw', amount: -order.aznAmount,
-            description: platform.toUpperCase() + ' Kod Alışı (Pay4bit)', createdAt: FieldValue.serverTimestamp()
+            type: 'deposit', amount: order.aznAmount,
+            description: 'Pay4bit depozit (' + order.method + ')', createdAt: FieldValue.serverTimestamp()
           });
-          payUpdate.codeStatus = 'delivered';
-          payUpdate.code = codeStr;
-        } else {
-          tx.set(db.collection('codeRequests').doc(account), {
-            uid: order.uid, userName: u.displayName || '', userUniqueId: u.uniqueId || '',
-            platform, amount: order.aznAmount, status: 'pending', code: '',
-            paid: true, orderId: account, createdAt: FieldValue.serverTimestamp()
+        }
+        if (bonus > 0) {
+          tx.set(userRef.collection('history').doc('bonus_' + account), {
+            type: 'bonus', amount: bonus,
+            description: 'PayÇarx bonus: ilk depozitin 2 qatı', createdAt: FieldValue.serverTimestamp()
           });
-          payUpdate.codeStatus = 'admin_pending';
-          payUpdate.codeRequestId = account;
+        }
+
+        if (purpose === 'code') {
+          if (poolSnap && !poolSnap.empty) {
+            const poolDoc = poolSnap.docs[0];
+            const codeStr = poolDoc.data().code;
+            tx.update(poolDoc.ref, {
+              status: 'used', usedByUid: order.uid,
+              usedByUniqueId: u.uniqueId || '', usedAt: FieldValue.serverTimestamp()
+            });
+            tx.set(userRef.collection('codes').doc('pay_' + account), {
+              code: codeStr, platform, amount: order.aznAmount, source: 'pool',
+              status: 'active', createdAt: FieldValue.serverTimestamp()
+            });
+            tx.set(userRef.collection('history').doc('pay_' + account), {
+              type: 'withdraw', amount: -order.aznAmount,
+              description: platform.toUpperCase() + ' Kod Alışı (Pay4bit)', createdAt: FieldValue.serverTimestamp()
+            });
+            payUpdate.codeStatus = 'delivered';
+            payUpdate.code = codeStr;
+          } else {
+            tx.set(db.collection('codeRequests').doc(account), {
+              uid: order.uid, userName: u.displayName || '', userUniqueId: u.uniqueId || '',
+              platform, amount: order.aznAmount, status: 'pending', code: '',
+              paid: true, orderId: account, createdAt: FieldValue.serverTimestamp()
+            });
+            payUpdate.codeStatus = 'admin_pending';
+            payUpdate.codeRequestId = account;
+          }
         }
         tx.update(ref, payUpdate);
       });
+      console.log('[callback] PAY uğurlu', account, order.purpose, order.aznAmount, 'AZN');
       return reply('Request successfully processed');
     }
     return reply('Unknown method', 400);
