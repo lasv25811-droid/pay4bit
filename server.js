@@ -79,6 +79,7 @@ console.log('Firebase service account yükləndi.');
 
 admin.initializeApp({ credential: admin.credential.cert(SA) });
 const db = admin.firestore();
+try { db.settings({ ignoreUndefinedProperties: true }); } catch (_) {}
 const FieldValue = admin.firestore.FieldValue;
 
 const app = express();
@@ -130,7 +131,9 @@ async function getAznPerEur() {
     try { rateCache = { aznPerEur: await fetchBackupEur(), at: Date.now(), source: 'er-api' }; }
     catch (e2) {
       if (rateCache.aznPerEur) return rateCache;
-      throw new Error('Məzənnə əldə edilə bilmədi');
+      // Hər iki mənbə işləməsə də ödəniş dayanmasın: ehtiyat sabit kurs
+      rateCache = { aznPerEur: Number(process.env.FALLBACK_AZN_PER_EUR || 1.98), at: Date.now() - RATE_TTL + 60000, source: 'fallback' };
+      console.warn('[rate] CBAR və ehtiyat mənbə işləmədi, sabit kurs:', rateCache.aznPerEur);
     }
   }
   return rateCache;
@@ -226,7 +229,7 @@ app.post(['/create-payment', '/api/create-payment'], authUser, async (req, res) 
     });
   } catch (e) {
     console.error('[create-payment]', e);
-    res.status(500).json({ success: false, error: 'Server xətası' });
+    res.status(500).json({ success: false, error: 'Server xətası, yenidən cəhd edin' });
   }
 });
 
@@ -371,6 +374,11 @@ app.get('/pay4bit/callback', pay4bitCallback);
 app.post('/pay4bit/callback', pay4bitCallback);
 
 app.get(['/health', '/api/health'], (req, res) => res.json({ ok: true }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'pay4bit-server' }));
+
+app.use((req, res) => res.status(404).json({ success: false, error: 'Tapılmadı' }));
+app.use((err, req, res, next) => { console.error('[express]', err); res.status(500).json({ success: false, error: 'Server xətası' }); });
+process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server ${PORT} portunda işləyir`));
