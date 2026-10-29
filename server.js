@@ -19,8 +19,13 @@ const path = require('path');
 const admin = require('firebase-admin');
 
 // ---------- Konfiqurasiya ----------
-const PUBLIC_KEY = process.env.PAY4BIT_PUBLIC_KEY || '36cf4-712';
-const SECRET_KEY = process.env.PAY4BIT_SECRET_KEY || 'd868aee241455e82f6d3a99cb3283d73';
+// Açarlar HEÇ VAXT kodda saxlanmır — yalnız mühit dəyişənlərindən (Render -> Environment) oxunur.
+const PUBLIC_KEY = process.env.PAY4BIT_PUBLIC_KEY || '';
+const SECRET_KEY = process.env.PAY4BIT_SECRET_KEY || '';
+if (!PUBLIC_KEY || !SECRET_KEY) {
+  console.error('PAY4BIT_PUBLIC_KEY və PAY4BIT_SECRET_KEY mühit dəyişənləri təyin edilməyib.');
+  process.exit(1);
+}
 
 // Firebase service account (null qalsa mühit dəyişənindən oxunur)
 const FIREBASE_SA = null;
@@ -74,13 +79,14 @@ if (!SA || !SA.private_key || !SA.client_email) {
   process.exit(1);
 }
 SA.private_key = String(SA.private_key).replace(/\\n/g, '\n');
-console.log('Firebase service account yükləndi:', SA.project_id, SA.client_email);
+console.log('Firebase service account yükləndi.');
 
 admin.initializeApp({ credential: admin.credential.cert(SA) });
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
 
 const app = express();
+app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(cors({
   origin: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : true,
@@ -164,7 +170,7 @@ async function authUser(req, res, next) {
 }
 
 // ---------- Məzənnə (frontend önbaxışı üçün) ----------
-app.get('/rate', async (req, res) => {
+app.get(['/rate', '/api/rate'], async (req, res) => {
   try {
     const r = await getAznPerEur();
     res.json({ success: true, currency: CHARGE_CURRENCY, aznPerEur: r.aznPerEur, source: r.source });
@@ -172,7 +178,7 @@ app.get('/rate', async (req, res) => {
 });
 
 // ---------- Ödəniş yarat ----------
-app.post('/create-payment', authUser, async (req, res) => {
+app.post(['/create-payment', '/api/create-payment'], authUser, async (req, res) => {
   try {
     const method = String(req.body.method || '');
     const purpose = req.body.purpose === 'deposit' ? 'deposit' : 'code';
@@ -229,7 +235,7 @@ app.post('/create-payment', authUser, async (req, res) => {
 });
 
 // ---------- Ödəniş statusu (istifadəçi geri qayıdanda) ----------
-app.get('/payment-status', authUser, async (req, res) => {
+app.get(['/payment-status', '/api/payment-status'], authUser, async (req, res) => {
   const snap = await db.collection('payments').doc(String(req.query.order || '')).get();
   if (!snap.exists || snap.data().uid !== req.user.uid) return res.status(404).json({ success: false });
   const d = snap.data();
@@ -368,7 +374,7 @@ async function pay4bitCallback(req, res) {
 app.get('/pay4bit/callback', pay4bitCallback);
 app.post('/pay4bit/callback', pay4bitCallback);
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get(['/health', '/api/health'], (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server ${PORT} portunda işləyir`));
