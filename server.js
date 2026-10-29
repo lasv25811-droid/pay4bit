@@ -19,13 +19,9 @@ const path = require('path');
 const admin = require('firebase-admin');
 
 // ---------- Konfiqurasiya ----------
-// Açarlar HEÇ VAXT kodda saxlanmır — yalnız mühit dəyişənlərindən (Render -> Environment) oxunur.
-const PUBLIC_KEY = process.env.PAY4BIT_PUBLIC_KEY || '';
-const SECRET_KEY = process.env.PAY4BIT_SECRET_KEY || '';
-if (!PUBLIC_KEY || !SECRET_KEY) {
-  console.error('PAY4BIT_PUBLIC_KEY və PAY4BIT_SECRET_KEY mühit dəyişənləri təyin edilməyib.');
-  process.exit(1);
-}
+// Test üçün açarlar birbaşa kodda yazılıb (mühit dəyişəni varsa, o üstünlük təşkil edir).
+const PUBLIC_KEY = process.env.PAY4BIT_PUBLIC_KEY || '36cf4-712';
+const SECRET_KEY = process.env.PAY4BIT_SECRET_KEY || 'd868aee241455e82f6d3a99cb3283d73';
 
 // Firebase service account (null qalsa mühit dəyişənindən oxunur)
 const FIREBASE_SA = null;
