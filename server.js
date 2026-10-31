@@ -316,6 +316,7 @@ async function pay4bitCallback(req, res) {
         if (purpose === 'deposit') balanceAdd += order.aznAmount;
         if (bonus > 0) { balanceAdd += bonus; userUpd.firstDepositBonus = 'used'; }
         if (balanceAdd > 0) userUpd.balance = FieldValue.increment(round2(balanceAdd));
+        if (purpose === 'deposit') userUpd.hasDeposited = true;   // PayÇarx: depozit edənlər köhnə qaydada fırlayır
         tx.update(userRef, userUpd);
 
         if (purpose === 'deposit') {
@@ -373,6 +374,9 @@ async function pay4bitCallback(req, res) {
 app.get('/pay4bit/callback', pay4bitCallback);
 app.post('/pay4bit/callback', pay4bitCallback);
 
+// PayÇarx (fırlatma) marşrutları: /spin-state, /spin
+require('./spin-route')(app, { admin, db });
+
 app.get(['/health', '/api/health'], (req, res) => res.json({ ok: true }));
 app.get('/', (req, res) => res.json({ ok: true, service: 'pay4bit-server' }));
 
@@ -382,3 +386,7 @@ process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server ${PORT} portunda işləyir`));
+
+// Render pulsuz planda yatmasın deyə hər 10 dəqiqədən bir özünü çağırır
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || 'https://pay4bit.onrender.com';
+setInterval(() => { fetch(SELF_URL + '/health', { signal: AbortSignal.timeout(15000) }).catch(() => {}); }, 10 * 60 * 1000);

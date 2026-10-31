@@ -24,27 +24,32 @@ const FREE_SPIN_MS = 24 * 60 * 60 * 1000;
 /* DİQQƏT: sıra və say paycarx.html-dəki SEGMENTS ilə EYNİ olmalıdır (client yalnız indeksi alır
    və bucaqlara görə fırladır). Çəkiləri (w) YALNIZ buradan dəyiş. */
 const SEGMENTS = [
-  { type: 'money',  value: 1,   label: '1 AZN',                w: 20 },
-  { type: 'spin',   value: 2,   label: 'PayÇarx 2 dəfə',       w: 1  },
-  { type: 'money',  value: 2,   label: '2 AZN',                w: 20 },
-  { type: 'x2',     value: 2,   label: 'İlk depozitin 2 qatı', w: 7  },
-  { type: 'money',  value: 3,   label: '3 AZN',                w: 10 },
-  { type: 'lose',   value: 0,   label: 'Bu dəfə olmadı',       w: 20 },
-  { type: 'money',  value: 5,   label: '5 AZN',                w: 1  },
-  { type: 'points', value: 100, label: '100 level xalı',       w: 6  },
-  { type: 'money',  value: 4,   label: '4 AZN',                w: 5  },
-  { type: 'points', value: 50,  label: '50 level xalı',        w: 9  },
-  { type: 'money',  value: 10,  label: '10 AZN',               w: 1  }
+  { type: 'money',  value: 1,   label: '1 AZN',                w: 20, nw: 10 },
+  { type: 'spin',   value: 2,   label: 'PayÇarx 2 dəfə',       w: 1,  nw: 0  },
+  { type: 'money',  value: 2,   label: '2 AZN',                w: 20, nw: 10 },
+  { type: 'x2',     value: 2,   label: 'İlk depozitin 2 qatı', w: 7,  nw: 3  },
+  { type: 'money',  value: 3,   label: '3 AZN',                w: 10, nw: 35 },
+  { type: 'lose',   value: 0,   label: 'Bu dəfə olmadı',       w: 20, nw: 10 },
+  { type: 'money',  value: 5,   label: '5 AZN',                w: 1,  nw: 0  },
+  { type: 'points', value: 100, label: '100 level xalı',       w: 6,  nw: 2  },
+  { type: 'money',  value: 4,   label: '4 AZN',                w: 5,  nw: 0  },
+  { type: 'points', value: 50,  label: '50 level xalı',        w: 9,  nw: 30 },
+  { type: 'money',  value: 10,  label: '10 AZN',               w: 1,  nw: 0  }
 ];
+/* w  = depozit edmiş istifadəçilər üçün (köhnə qayda)
+   nw = hələ depozit etməyənlər üçün: 3 AZN və 50 xal şansı daha çox, böyük mükafatlar bağlıdır */
 const TOTAL_W = SEGMENTS.reduce((a, s) => a + s.w, 0);
+const TOTAL_NW = SEGMENTS.reduce((a, s) => a + s.nw, 0);
 
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
 /* Kriptoqrafik təsadüfilik (Math.random əvəzinə) */
-function pickSegment(rand = crypto.randomInt) {
-  let r = rand(0, TOTAL_W);
+function pickSegment(deposited = true, rand = crypto.randomInt) {
+  const key = deposited ? 'w' : 'nw';
+  const total = deposited ? TOTAL_W : TOTAL_NW;
+  let r = rand(0, total);
   for (let i = 0; i < SEGMENTS.length; i++) {
-    r -= SEGMENTS[i].w;
+    r -= SEGMENTS[i][key];
     if (r < 0) return i;
   }
   return SEGMENTS.length - 1;
@@ -125,6 +130,18 @@ function registerSpinRoutes(app, { admin, db }) {
     return fail(res, 500, 'server_error');
   }
 
+  /* İstifadəçi depozit edibmi? (bayraq və ya uğurlu depozit ödənişi) */
+  async function userHasDeposited(ref, uid) {
+    try {
+      const u = await ref.get();
+      if (u.exists && u.data().hasDeposited === true) return true;
+      const q = await db.collection('payments')
+        .where('uid', '==', uid).where('purpose', '==', 'deposit').where('status', '==', 'paid').limit(1).get();
+      if (!q.empty) { try { await ref.update({ hasDeposited: true }); } catch (_) {} return true; }
+    } catch (e) { console.warn('[spin] deposit check:', e.message); }
+    return false;
+  }
+
   /* Vəziyyət + pulsuz fırlatma yoxlaması */
   async function stateHandler(req, res) {
     const uid = await uidFromReq(req);
@@ -151,6 +168,7 @@ function registerSpinRoutes(app, { admin, db }) {
     if (!uid) return fail(res, 401, 'unauthorized');
     try {
       const ref = db.collection('users').doc(uid);
+      const dep = await userHasDeposited(ref, uid);
       const out = await db.runTransaction(async (tx) => {
         const snap = await tx.get(ref);
         if (!snap.exists) throw new Error('user_not_found');
@@ -161,7 +179,7 @@ function registerSpinRoutes(app, { admin, db }) {
         const free = resolveSpins(d, now);
         if (free.spins < 1) throw new Error('no_spins');
 
-        const idx = pickSegment();
+        const idx = pickSegment(dep);
         const { upd, alreadyX2, prize } = applyPrize(d, free.spins, idx, now);
         tx.update(ref, upd);
         tx.set(ref.collection('history').doc(), {
@@ -189,4 +207,4 @@ function registerSpinRoutes(app, { admin, db }) {
 
 module.exports = registerSpinRoutes;
 /* test üçün */
-module.exports._internals = { SEGMENTS, TOTAL_W, FREE_SPIN_MS, pickSegment, resolveSpins, applyPrize, lastRefMs };
+module.exports._internals = { SEGMENTS, TOTAL_W, TOTAL_NW, FREE_SPIN_MS, pickSegment, resolveSpins, applyPrize, lastRefMs };
