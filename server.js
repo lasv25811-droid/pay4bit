@@ -612,6 +612,9 @@ app.get(['/otp/status', '/api/otp/status'], authUser, async (req, res) => {
 // PayÇarx (fırlatma) marşrutları: /spin-state, /spin
 require('./spin-route')(app, { admin, db });
 
+// Şifrə yeniləmə (e-mail kodu): /password-reset/lookup, /send, /confirm
+require('./password-reset-route')(app, { admin, db });
+
 app.get(['/health', '/api/health'], (req, res) => res.json({ ok: true }));
 app.get('/', (req, res) => res.json({ ok: true, service: 'pay4bit-server' }));
 
