@@ -477,13 +477,19 @@ async function otpSend(req, res, isResend) {
     const phone = normPhoneAz(u.phone);
     if (!phone) return res.status(400).json({ success: false, error: 'Əvvəlcə düzgün nömrə əlavə edin' });
 
-    const dup = await db.collection('users').where('phone', '==', phone).where('phoneVerified', '==', true).limit(3).get();
-    if (dup.docs.some(d => d.id !== uid)) return res.status(409).json({ success: false, error: 'Bu nömrə başqa hesabda doğrulanıb' });
+    // Tək sahə üzrə sorğu (kompozit indeks tələb etmir) + yaddaşda süzgəc.
+    // Sorğu uğursuz olsa belə SMS göndərilməsi dayanmasın.
+    try {
+      const dup = await db.collection('users').where('phone', '==', phone).limit(10).get();
+      if (dup.docs.some(d => d.id !== uid && d.data().phoneVerified === true)) {
+        return res.status(409).json({ success: false, error: 'Bu nömrə başqa hesabda doğrulanıb' });
+      }
+    } catch (e) { console.warn('[otp] dublikat yoxlaması keçildi:', e && e.message); }
 
     const sref = db.collection('otpSessions').doc(uid);
     const s = (await sref.get()).data() || {};
     const now = Date.now();
-    const sends = (s.sends || []).filter(t => now - t < 3600000);
+    const sends = (Array.isArray(s.sends) ? s.sends : []).filter(t => Number(t) && now - t < 3600000);
     if (sends.length) {
       const wait = OTP_COOLDOWN_MS - (now - sends[sends.length - 1]);
       if (wait > 0) return res.status(429).json({ success: false, error: `${Math.ceil(wait / 1000)} saniyə sonra yenidən göndərin`, retryAfter: Math.ceil(wait / 1000) });
@@ -527,7 +533,7 @@ async function otpSend(req, res, isResend) {
     });
   } catch (e) {
     console.error('[otp-send]', e);
-    res.status(502).json({ success: false, error: 'SMS xidməti müvəqqəti əlçatmazdır' });
+    res.status(500).json({ success: false, error: 'Server xətası, bir az sonra yenidən cəhd edin' });
   }
 }
 
