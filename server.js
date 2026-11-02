@@ -19,9 +19,13 @@ const path = require('path');
 const admin = require('firebase-admin');
 
 // ---------- Konfiqurasiya ----------
-// Test üçün açarlar birbaşa kodda yazılıb (mühit dəyişəni varsa, o üstünlük təşkil edir).
-const PUBLIC_KEY = process.env.PAY4BIT_PUBLIC_KEY || '36cf4-712';
-const SECRET_KEY = process.env.PAY4BIT_SECRET_KEY || 'd868aee241455e82f6d3a99cb3283d73';
+// Açarlar YALNIZ mühit dəyişənlərindən oxunur (kodda saxlanmır).
+const PUBLIC_KEY = process.env.PAY4BIT_PUBLIC_KEY || '';
+const SECRET_KEY = process.env.PAY4BIT_SECRET_KEY || '';
+if (!PUBLIC_KEY || !SECRET_KEY) {
+  console.error('PAY4BIT_PUBLIC_KEY / PAY4BIT_SECRET_KEY mühit dəyişənləri təyin olunmayıb.');
+  process.exit(1);
+}
 
 // Firebase service account (null qalsa mühit dəyişənindən oxunur)
 const FIREBASE_SA = null;
@@ -85,12 +89,36 @@ const FieldValue = admin.firestore.FieldValue;
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
+
+// ---- Təhlükəsizlik başlıqları ----
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
+// ---- Ümumi sorğu limiti (IP başına dəqiqədə 240; callback və health istisna) ----
+const globalHits = new Map();
+setInterval(() => { const now = Date.now(); for (const [k, v] of globalHits) if (now - v.t > 60000) globalHits.delete(k); }, 60000).unref();
+app.use((req, res, next) => {
+  if (req.path === '/pay4bit/callback' || req.path === '/health' || req.path === '/api/health') return next();
+  const ip = String(req.ip || '');
+  const now = Date.now();
+  let e = globalHits.get(ip);
+  if (!e || now - e.t > 60000) e = { t: now, n: 0 };
+  e.n++; globalHits.set(ip, e);
+  if (e.n > 240) return res.status(429).json({ success: false, error: 'Çox sorğu, bir az sonra yoxlayın' });
+  next();
+});
 app.use(cors({
   origin: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : true,
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '20kb' }));
+app.use(express.urlencoded({ extended: true, limit: '20kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------- Aktiv məzənnə (AZN -> EUR) ----------
@@ -292,10 +320,12 @@ async function pay4bitCallback(req, res) {
         const userRef = db.collection('users').doc(order.uid);
         const userSnap = await tx.get(userRef);
         const u = userSnap.exists ? userSnap.data() : {};
-        let poolSnap = null;
+        let poolSnap = null, secretSnap = null;
         if (purpose === 'code') {
           poolSnap = await tx.get(db.collection('fastlotoCodes')
             .where('amount', '==', order.aznAmount).where('status', '==', 'available').limit(1));
+          // Kodun özü fastlotoSecrets/{id}-də saxlanır (admin paneli belə yazır)
+          if (!poolSnap.empty) secretSnap = await tx.get(db.collection('fastlotoSecrets').doc(poolSnap.docs[0].id));
         }
 
         // ---- yazmalar ----
@@ -335,7 +365,7 @@ async function pay4bitCallback(req, res) {
         if (purpose === 'code') {
           if (poolSnap && !poolSnap.empty) {
             const poolDoc = poolSnap.docs[0];
-            const codeStr = poolDoc.data().code;
+            const codeStr = String((secretSnap && secretSnap.exists && secretSnap.data().code) || poolDoc.data().code || '');
             tx.update(poolDoc.ref, {
               status: 'used', usedByUid: order.uid,
               usedByUniqueId: u.uniqueId || '', usedAt: FieldValue.serverTimestamp()
@@ -425,9 +455,9 @@ function otpFail(res, r) {
   console.warn('[otp] xəta', r.status, detail);
   const map = {
     0:   [502, 'SMS xidməti ilə əlaqə qurulmadı, bir az sonra yenidən cəhd edin'],
-    401: [502, 'SMS xidməti API açarını qəbul etmir (Render-də OTP_API_KEY yoxlanmalıdır)'],
-    402: [502, 'SMS xidmətində balans bitib (OTPBAY → Billing → Top up)'],
-    403: [403, 'SMS xidməti sınaq rejimindədir: yalnız təsdiqlənmiş nömrələrə göndərə bilir (OTPBAY → Top up)'],
+    401: [502, 'SMS xidməti müvəqqəti əlçatmazdır'],
+    402: [502, 'SMS xidməti müvəqqəti əlçatmazdır'],
+    403: [502, 'SMS xidməti müvəqqəti əlçatmazdır'],
     404: [400, 'Kodun vaxtı bitib, yenidən göndərin'],
     409: [409, 'Bu nömrə üçün SMS kanalı aktiv deyil'],
     400: [400, 'Nömrə və ya kod düzgün deyil'],
@@ -435,7 +465,7 @@ function otpFail(res, r) {
     429: [429, 'Çox tez cəhd edildi, bir az gözləyin']
   };
   const m = map[r.status] || [502, 'SMS xidməti müvəqqəti əlçatmazdır'];
-  return res.status(m[0]).json({ success: false, error: m[1] + (detail && r.status !== 429 && r.status !== 404 ? ' [' + detail + ']' : '') });
+  return res.status(m[0]).json({ success: false, error: m[1] });
 }
 const cleanIp = ip => String(ip || '').replace(/^::ffff:/i, '');
 function otpIpAllowed(ip) {
@@ -529,6 +559,7 @@ async function otpSend(req, res, isResend) {
 
 // Diaqnostika: açar işləyirmi? (brauzerdə aç: /api/otp/diag) — SMS göndərmir
 app.get(['/otp/diag', '/api/otp/diag'], async (req, res) => {
+  if (!process.env.DIAG_TOKEN || !safeEq(req.headers['x-diag-token'], process.env.DIAG_TOKEN)) return res.status(404).json({ success: false });
   if (!otpIpAllowed(req.ip)) return res.status(429).json({ ok: false });
   const r = await otpApi('GET', '/verifications/VE00000000000000000000000000000000');
   if (!OTP_API_KEY) return res.json({ ok: false, keyStatus: 'MISSING (Render-də OTP_API_KEY yoxdur)', base: OTP_BASE });
@@ -538,7 +569,6 @@ app.get(['/otp/diag', '/api/otp/diag'], async (req, res) => {
   res.json({
     ok: r.status !== 401 && r.status !== 0,
     keyStatus, httpStatus: r.status, base: OTP_BASE,
-    keyUsed: OTP_API_KEY ? OTP_API_KEY.slice(0, 8) + '…' + OTP_API_KEY.slice(-4) : null,
     keyFromEnv: !!process.env.OTP_API_KEY,
     providerMessage: (r.data && r.data.error && r.data.error.message) || null
   });
@@ -613,7 +643,7 @@ require('./spin-route')(app, { admin, db });
 require('./password-reset-route')(app, { admin, db });
 
 app.get(['/health', '/api/health'], (req, res) => res.json({ ok: true }));
-app.get('/', (req, res) => res.json({ ok: true, service: 'pay4bit-server' }));
+app.get('/', (req, res) => res.json({ ok: true }));
 
 app.use((req, res) => res.status(404).json({ success: false, error: 'Tapılmadı' }));
 app.use((err, req, res, next) => { console.error('[express]', err); res.status(500).json({ success: false, error: 'Server xətası' }); });
@@ -623,5 +653,5 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server ${PORT} portunda işləyir`));
 
 // Render pulsuz planda yatmasın deyə hər 10 dəqiqədən bir özünü çağırır
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || 'https://pay4bit.onrender.com';
-setInterval(() => { fetch(SELF_URL + '/health', { signal: AbortSignal.timeout(15000) }).catch(() => {}); }, 10 * 60 * 1000);
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || '';
+if (SELF_URL) setInterval(() => { fetch(SELF_URL + '/health', { signal: AbortSignal.timeout(15000) }).catch(() => {}); }, 10 * 60 * 1000);
