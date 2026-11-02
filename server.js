@@ -376,7 +376,7 @@ app.post('/pay4bit/callback', pay4bitCallback);
 
 // ---------- OTP (otp.com) — nömrə təsdiqi ----------
 // Açar Render-də OTP_API_KEY mühit dəyişəni ilə də verilə bilər (varsa o üstünlük təşkil edir).
-const OTP_API_KEY = process.env.OTP_API_KEY || 'otp_live_64Qv1d2wKDwelm1mNEH9J5PWzJCE5K';
+const OTP_API_KEY = String(process.env.OTP_API_KEY || 'otp_live_64Qv1d2wKDwelm1mNEH9J5PWzJCE5K').trim().replace(/^["']+|["']+$/g, '');
 const OTP_BASE = (process.env.OTP_BASE_URL || 'https://api.otp.com/api/v1').replace(/\/+$/, '');
 const OTP_LOCALE = process.env.OTP_LOCALE || '';          // məs: 'az' (boşdursa göndərilmir)
 const OTP_COOLDOWN_MS = 60 * 1000;                         // təkrar göndərmə arası
@@ -404,28 +404,35 @@ function normPhoneAz(raw) {
 }
 
 async function otpApi(method, path, body) {
-  const r = await fetch(OTP_BASE + path, {
-    method,
-    headers: { Authorization: 'Bearer ' + OTP_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(15000)
-  });
-  const data = await r.json().catch(() => ({}));
-  return { ok: r.ok, status: r.status, data };
+  try {
+    const r = await fetch(OTP_BASE + path, {
+      method,
+      headers: { Authorization: 'Bearer ' + OTP_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { error: { type: 'network', message: String((e && e.message) || e) } } };
+  }
 }
 function otpFail(res, r) {
   const e = (r.data && r.data.error) || {};
-  console.warn('[otp] xəta', r.status, e.type || '', e.message || '');
+  const detail = [e.type, e.message].filter(Boolean).join(': ').slice(0, 200);
+  console.warn('[otp] xəta', r.status, detail);
   const map = {
-    401: [502, 'SMS xidməti konfiqurasiya xətası (API açarı)'],
+    0:   [502, 'SMS xidməti ilə əlaqə qurulmadı, bir az sonra yenidən cəhd edin'],
+    401: [502, 'SMS xidməti API açarını qəbul etmir (otp.com panelində açar və tətbiq aktiv olmalıdır)'],
     404: [400, 'Kodun vaxtı bitib, yenidən göndərin'],
-    409: [409, 'Bu nömrəyə hazırda kod göndərmək mümkün olmadı'],
+    409: [409, 'otp.com-da bu nömrə üçün SMS kanalı aktiv deyil (panel → Channels / Routing)'],
     422: [400, 'Nömrə və ya kod düzgün deyil'],
     429: [429, 'Çox tez cəhd edildi, bir az gözləyin']
   };
   const m = map[r.status] || [502, 'SMS xidməti müvəqqəti əlçatmazdır'];
-  return res.status(m[0]).json({ success: false, error: m[1] });
+  return res.status(m[0]).json({ success: false, error: m[1] + (detail && r.status !== 429 && r.status !== 404 ? ' [' + detail + ']' : '') });
 }
+const cleanIp = ip => String(ip || '').replace(/^::ffff:/i, '');
 function otpIpAllowed(ip) {
   const now = Date.now();
   const arr = (otpIpHits.get(ip) || []).filter(t => now - t < 3600000);
@@ -490,9 +497,15 @@ async function otpSend(req, res, isResend) {
       if (!r.ok) r = null;                                   // resend mümkün deyil -> təzə göndər
     }
     if (!r) {
-      const body = { recipient: phone, client_ip: req.ip };
+      const body = { recipient: phone };
+      const ip = cleanIp(req.ip);
+      if (ip) body.client_ip = ip;
       if (OTP_LOCALE) body.locale = OTP_LOCALE;
       r = await otpApi('POST', '/otp/send', body);
+      if (!r.ok && r.status === 422 && body.client_ip) {      // IP formatı qəbul olunmadısa, IP-siz yenidən
+        delete body.client_ip;
+        r = await otpApi('POST', '/otp/send', body);
+      }
       if (!r.ok) return otpFail(res, r);
     }
 
@@ -517,6 +530,22 @@ async function otpSend(req, res, isResend) {
     res.status(502).json({ success: false, error: 'SMS xidməti müvəqqəti əlçatmazdır' });
   }
 }
+
+// Diaqnostika: açar işləyirmi? (brauzerdə aç: /api/otp/diag) — SMS göndərmir
+app.get(['/otp/diag', '/api/otp/diag'], async (req, res) => {
+  if (!otpIpAllowed(req.ip)) return res.status(429).json({ ok: false });
+  const r = await otpApi('GET', '/otp/diag-ping-000');
+  const keyStatus = r.status === 401 ? 'INVALID (açar yanlışdır / tətbiq söndürülüb / şirkət dayandırılıb)'
+    : r.status === 0 ? 'UNREACHABLE (api.otp.com-a qoşulmaq olmadı)'
+    : 'VALID (açar qəbul olundu)';
+  res.json({
+    ok: r.status !== 401 && r.status !== 0,
+    keyStatus, httpStatus: r.status, base: OTP_BASE,
+    keyUsed: OTP_API_KEY.slice(0, 12) + '…' + OTP_API_KEY.slice(-4),
+    keyFromEnv: !!process.env.OTP_API_KEY,
+    providerMessage: (r.data && r.data.error && r.data.error.message) || null
+  });
+});
 
 app.post(['/otp/send', '/api/otp/send'], authUser, (req, res) => otpSend(req, res, false));
 app.post(['/otp/resend', '/api/otp/resend'], authUser, (req, res) => otpSend(req, res, true));
