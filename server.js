@@ -339,9 +339,10 @@ async function pay4bitCallback(req, res) {
         };
 
         const userUpd = {
-          points: FieldValue.increment(order.aznAmount),       // 1 AZN = 1 xal
-          payWheelSpins: FieldValue.increment(1)
+          points: FieldValue.increment(order.aznAmount)        // 1 AZN = 1 xal
         };
+        // PayÇarx: hər uğurlu DEPOZİT 1 fırlatma açır (kod alışı fırlatma vermir)
+        if (purpose === 'deposit') userUpd.payWheelSpins = FieldValue.increment(1);
         let balanceAdd = 0;
         if (purpose === 'deposit') balanceAdd += order.aznAmount;
         if (bonus > 0) { balanceAdd += bonus; userUpd.firstDepositBonus = 'used'; }
