@@ -275,6 +275,24 @@ app.get(['/payment-status', '/api/payment-status'], authUser, async (req, res) =
   });
 });
 
+// ---------- 2027 Yeni İl Kampaniyası (YeKod) ----------
+// Uğurlu Pay4bit DEPOZİTİ edən hər istifadəçiyə (bir nəfərə bir kod) avtomatik YeKod verilir.
+// campaignCodes/{kod}  -> açıq səbət (yalnız ID + kod, ad/uid YOXDUR)
+// campaignOwners/{uid} -> istifadəçinin öz kodu (yalnız özü oxuya bilir)
+const CAMPAIGN_END = new Date(process.env.CAMPAIGN_END_ISO || '2026-12-31T20:00:00Z'); // 1 yanvar 2027 00:00 (Bakı)
+const CAMPAIGN_START = process.env.CAMPAIGN_START_ISO ? new Date(process.env.CAMPAIGN_START_ISO) : null;
+const YE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 0/O, 1/I qarışmasın
+function genYeKod() {
+  const b = crypto.randomBytes(8);
+  let c = '';
+  for (let i = 0; i < 8; i++) c += YE_ALPHABET[b[i] % YE_ALPHABET.length];
+  return 'YE-' + c.slice(0, 4) + '-' + c.slice(4);
+}
+function campaignActive() {
+  const now = new Date();
+  return now < CAMPAIGN_END && (!CAMPAIGN_START || now >= CAMPAIGN_START);
+}
+
 // ---------- Pay4bit callback (CHECK / PAY / ERROR) ----------
 async function pay4bitCallback(req, res) {
   const reply = (message, code = 200) => res.status(code).json({ result: { message } });
@@ -328,6 +346,20 @@ async function pay4bitCallback(req, res) {
           if (!poolSnap.empty) secretSnap = await tx.get(db.collection('fastlotoSecrets').doc(poolSnap.docs[0].id));
         }
 
+        // ---- 2027 kampaniya: bu istifadəçinin kodu varmı? yoxdursa boş kod seç ----
+        let campaignNew = null, campaignOwnerRef = null;
+        if (purpose === 'deposit' && campaignActive()) {
+          campaignOwnerRef = db.collection('campaignOwners').doc(order.uid);
+          const ownSnap = await tx.get(campaignOwnerRef);
+          if (!ownSnap.exists) {
+            for (let i = 0; i < 6 && !campaignNew; i++) {
+              const cand = genYeKod();
+              const cs = await tx.get(db.collection('campaignCodes').doc(cand));
+              if (!cs.exists) campaignNew = cand;
+            }
+          }
+        }
+
         // ---- yazmalar ----
         const platform = order.platform || 'fastloto';
         const bonus = (u.firstDepositBonus === 'pending') ? round2(order.aznAmount) : 0;   // PayÇarx: ilk depozit 2x
@@ -355,6 +387,16 @@ async function pay4bitCallback(req, res) {
             type: 'deposit', amount: order.aznAmount,
             description: 'Pay4bit depozit (' + order.method + ')', createdAt: FieldValue.serverTimestamp()
           });
+        }
+        if (campaignNew) {
+          tx.set(db.collection('campaignCodes').doc(campaignNew), {
+            code: campaignNew, uniqueId: u.uniqueId || order.userUniqueId || '', createdAt: FieldValue.serverTimestamp()
+          });
+          tx.set(campaignOwnerRef, {
+            code: campaignNew, uniqueId: u.uniqueId || order.userUniqueId || '',
+            orderId: account, amount: order.aznAmount, createdAt: FieldValue.serverTimestamp()
+          });
+          payUpdate.campaignCode = campaignNew;
         }
         if (bonus > 0) {
           tx.set(userRef.collection('history').doc('bonus_' + account), {
