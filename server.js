@@ -276,9 +276,9 @@ app.get(['/payment-status', '/api/payment-status'], authUser, async (req, res) =
 });
 
 // ---------- 2027 Yeni İl Kampaniyası (YeKod) ----------
-// Uğurlu Pay4bit DEPOZİTİ edən hər istifadəçiyə (bir nəfərə bir kod) avtomatik YeKod verilir.
-// campaignCodes/{kod}  -> açıq səbət (yalnız ID + kod, ad/uid YOXDUR)
-// campaignOwners/{uid} -> istifadəçinin öz kodu (yalnız özü oxuya bilir)
+// Hər uğurlu Pay4bit DEPOZİTİNDƏ avtomatik YeKod verilir (çıxarışda isə admin təsdiq edəndə — admin.html).
+// Kod nə qədər çox olarsa, qazanma şansı o qədər çox olur.
+// campaignCodes/{kod} -> açıq səbət (yalnız ID + kod + mənbə; ad/uid YOXDUR)
 const CAMPAIGN_END = new Date(process.env.CAMPAIGN_END_ISO || '2026-12-31T20:00:00Z'); // 1 yanvar 2027 00:00 (Bakı)
 const CAMPAIGN_START = process.env.CAMPAIGN_START_ISO ? new Date(process.env.CAMPAIGN_START_ISO) : null;
 const YE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 0/O, 1/I qarışmasın
@@ -347,16 +347,12 @@ async function pay4bitCallback(req, res) {
         }
 
         // ---- 2027 kampaniya: bu istifadəçinin kodu varmı? yoxdursa boş kod seç ----
-        let campaignNew = null, campaignOwnerRef = null;
+        let campaignNew = null;
         if (purpose === 'deposit' && campaignActive()) {
-          campaignOwnerRef = db.collection('campaignOwners').doc(order.uid);
-          const ownSnap = await tx.get(campaignOwnerRef);
-          if (!ownSnap.exists) {
-            for (let i = 0; i < 6 && !campaignNew; i++) {
-              const cand = genYeKod();
-              const cs = await tx.get(db.collection('campaignCodes').doc(cand));
-              if (!cs.exists) campaignNew = cand;
-            }
+          for (let i = 0; i < 6 && !campaignNew; i++) {
+            const cand = genYeKod();
+            const cs = await tx.get(db.collection('campaignCodes').doc(cand));
+            if (!cs.exists) campaignNew = cand;
           }
         }
 
@@ -390,11 +386,8 @@ async function pay4bitCallback(req, res) {
         }
         if (campaignNew) {
           tx.set(db.collection('campaignCodes').doc(campaignNew), {
-            code: campaignNew, uniqueId: u.uniqueId || order.userUniqueId || '', createdAt: FieldValue.serverTimestamp()
-          });
-          tx.set(campaignOwnerRef, {
             code: campaignNew, uniqueId: u.uniqueId || order.userUniqueId || '',
-            orderId: account, amount: order.aznAmount, createdAt: FieldValue.serverTimestamp()
+            source: 'deposit', orderId: account, amount: order.aznAmount, createdAt: FieldValue.serverTimestamp()
           });
           payUpdate.campaignCode = campaignNew;
         }
