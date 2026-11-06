@@ -12,7 +12,12 @@
  *   registerSpinRoutes(app, { admin, db });   // admin = firebase-admin, db = admin.firestore()
  *
  * QAYDALAR (yeni):
- *   1) Qeydiyyatdan keçən HƏR KƏSƏ 1 dəfəlik PayÇarx hədiyyəsi (qeydiyyatdan 24 saat sonra, bir dəfə).
+ *   1) Qeydiyyat hədiyyəsi (1 dəfəlik PayÇarx) YALNIZ aşağıdakı şərtlərin HAMISI ödənəndə verilir:
+ *        a) hesabın telefon nömrəsi SMS ilə doğrulanıb (phoneVerified === true);
+ *        b) hədiyyə alan IP ünvan yenidir (eyni IP-dən əvvəl hədiyyə alınmayıb);
+ *        c) hədiyyə alan cihaz yenidir (eyni cihazdan əvvəl hədiyyə alınmayıb);
+ *        d) qeydiyyatdan WELCOME_DELAY_MS keçib (standart 24 saat; env ilə dəyişir, 0 = dərhal).
+ *      Claim qeydləri `welcomeClaims` kolleksiyasında saxlanır (yalnız server yazır/oxuyur).
  *   2) Hər 24 saatdan bir pulsuz fırlatma LƏĞV edilib. İstisna: profil səviyyəsi MATRIX (>= 5000 xal)
  *      olanlara hər 24 saatdan bir pulsuz fırlatma verilir.
  *   3) Hər uğurlu DEPOZİT 1 fırlatma açır (server.js callback-də).
@@ -28,6 +33,14 @@ const crypto = require('crypto');
 
 const FREE_SPIN_MS = 24 * 60 * 60 * 1000;
 const MATRIX_POINTS = 5000;   // admin.html RANKS: Matrix = 5000 xal
+
+/* Qeydiyyat hədiyyəsi qorunması (SMS + yeni IP + yeni cihaz) */
+const WELCOME_DELAY_MS = process.env.WELCOME_DELAY_MS !== undefined && process.env.WELCOME_DELAY_MS !== ''
+  ? Math.max(0, Number(process.env.WELCOME_DELAY_MS) || 0) : FREE_SPIN_MS;
+const WELCOME_MAX_PER_IP = Math.max(1, Number(process.env.WELCOME_MAX_PER_IP) || 1);       // 1 IP -> neçə hesab hədiyyə ala bilər
+const WELCOME_MAX_PER_DEVICE = Math.max(1, Number(process.env.WELCOME_MAX_PER_DEVICE) || 1); // 1 cihaz -> neçə hesab
+const CLAIM_SALT = process.env.WELCOME_CLAIM_SALT || 'yevrolato-welcome-v1';
+const DEVICE_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
 /* DİQQƏT: sıra və say paycarx.html-dəki SEGMENTS ilə EYNİ olmalıdır (client yalnız indeksi alır
    və bucaqlara görə fırladır). Çəkiləri (w) YALNIZ buradan dəyiş. */
@@ -79,21 +92,34 @@ function isMatrix(d) { return (Number(d.points) || 0) >= MATRIX_POINTS; }
 function welcomeDone(d) { return d.welcomeSpinGiven === true || (Number(d.lastSpinAtMs) || 0) > 0; }
 
 /* PayÇarx hüququ (SAF funksiya):
-   - qeydiyyat hədiyyəsi: hər hesaba 1 dəfə, qeydiyyatdan 24 saat sonra;
+   - qeydiyyat hədiyyəsi: hər hesaba 1 dəfə; SMS doğrulaması + yeni IP + yeni cihaz + gözləmə müddəti tələb olunur;
    - MATRIX: hər 24 saatdan bir 1 pulsuz fırlatma (yalnız fırlatma qalmayanda);
-   - digər hamı üçün gündəlik pulsuz fırlatma YOXDUR — yalnız depozit fırlatma açır. */
-function resolveSpins(d, now) {
+   - digər hamı üçün gündəlik pulsuz fırlatma YOXDUR — yalnız depozit fırlatma açır.
+   gate: IP/cihaz yoxlamasının nəticəsi (welcomeGate). null verilibsə və hədiyyə vaxtı çatıbsa,
+         `welcomeDue: true` qaytarılır — çağıran yoxlamanı edib funksiyanı gate ilə yenidən çağırmalıdır.
+   mode: 'welcome_sms' (nömrə doğrulanmayıb) | 'welcome' (gözləmə) | 'welcome_blocked' (IP/cihaz artıq istifadə olunub)
+         | 'welcome_device' (cihaz identifikatoru yoxdur) | 'matrix' | 'deposit' */
+function resolveSpins(d, now, gate) {
   let spins = Math.max(0, Math.floor(Number(d.payWheelSpins) || 0));
   const upd = {};
   const matrix = isMatrix(d);
   let nextFreeAtMs = 0;
-  let mode = 'deposit';          // 'welcome' | 'matrix' | 'deposit'
+  let mode = 'deposit';
+  let welcomeDue = false;
+  let welcomeGranted = false;
 
   if (spins === 0) {
     if (!welcomeDone(d)) {
-      const at = createdMs(d, now) + FREE_SPIN_MS;
-      if (now >= at) { spins = 1; upd.payWheelSpins = 1; upd.welcomeSpinGiven = true; }
-      else { nextFreeAtMs = at; mode = 'welcome'; }
+      if (d.phoneVerified !== true) {
+        mode = 'welcome_sms';                    // əvvəl SMS ilə nömrəni doğrula
+      } else {
+        const at = createdMs(d, now) + WELCOME_DELAY_MS;
+        if (now < at) { nextFreeAtMs = at; mode = 'welcome'; }
+        else if (!gate) { welcomeDue = true; mode = 'welcome_check'; }
+        else if (gate.ok) {
+          spins = 1; upd.payWheelSpins = 1; upd.welcomeSpinGiven = true; welcomeGranted = true;
+        } else { mode = gate.reason || 'welcome_blocked'; }
+      }
     } else if (matrix) {
       let last = Number(d.lastDailySpinAtMs) || 0;
       if (last > now) last = now;            // saat hiyləsi: gələcək vaxt "indi"yə endirilir
@@ -102,7 +128,7 @@ function resolveSpins(d, now) {
       else { nextFreeAtMs = at; mode = 'matrix'; }
     }
   }
-  return { spins, upd, nextFreeAtMs, mode, matrix };
+  return { spins, upd, nextFreeAtMs, mode, matrix, welcomeDue, welcomeGranted };
 }
 
 /* Nəticənin tətbiqi. SAF funksiya (test üçün ayrılıb). */
@@ -132,6 +158,7 @@ function publicState(d, upd, spins, info, now) {
     nextFreeAtMs: spins > 0 ? 0 : (info.nextFreeAtMs || 0),
     freeMode: spins > 0 ? 'ready' : info.mode,      // welcome | matrix | deposit | ready
     isMatrix: isMatrix(merged),
+    phoneVerified: merged.phoneVerified === true,
     matrixPoints: MATRIX_POINTS,
     points: r2(merged.points),
     serverNow: now,
@@ -147,6 +174,40 @@ function registerSpinRoutes(app, { admin, db }) {
     const m = String(req.headers.authorization || '').match(/^Bearer (.+)$/);
     if (!m) return null;
     try { return (await admin.auth().verifyIdToken(m[1])).uid; } catch (_) { return null; }
+  }
+
+  const hashKey = (v) => crypto.createHash('sha256').update(CLAIM_SALT + '|' + String(v)).digest('hex');
+  const cleanIp = (ip) => String(ip || '').replace(/^::ffff:/i, '').trim();
+  const getDeviceId = (req) => String((req.body && req.body.deviceId) || '').trim();
+
+  /* Qeydiyyat hədiyyəsi üçün IP + cihaz yoxlaması. Transaction daxilində OXUMA (yazma sonra, handler-də). */
+  async function welcomeGate(tx, uid, ip, deviceId) {
+    if (!DEVICE_ID_RE.test(deviceId || '')) return { ok: false, reason: 'welcome_device' };
+    if (!ip) return { ok: false, reason: 'welcome_blocked' };
+    const ipRef = db.collection('welcomeClaims').doc('ip_' + hashKey(ip));
+    const devRef = db.collection('welcomeClaims').doc('dev_' + hashKey(deviceId));
+    const [ipSnap, devSnap] = await Promise.all([tx.get(ipRef), tx.get(devRef)]);
+    const ipUids = ipSnap.exists && Array.isArray(ipSnap.data().uids) ? ipSnap.data().uids : [];
+    const devUids = devSnap.exists && Array.isArray(devSnap.data().uids) ? devSnap.data().uids : [];
+    const ipOk = ipUids.includes(uid) || ipUids.length < WELCOME_MAX_PER_IP;
+    const devOk = devUids.includes(uid) || devUids.length < WELCOME_MAX_PER_DEVICE;
+    if (!ipOk || !devOk) return { ok: false, reason: 'welcome_blocked' };
+    return { ok: true, ipRef, devRef, ipUids, devUids };
+  }
+  function writeWelcomeClaims(tx, gate, uid) {
+    const add = (arr) => (arr.includes(uid) ? arr : arr.concat(uid));
+    tx.set(gate.ipRef, { kind: 'ip', uids: add(gate.ipUids), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    tx.set(gate.devRef, { kind: 'device', uids: add(gate.devUids), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+  }
+  /* resolveSpins + (lazım olsa) IP/cihaz yoxlaması */
+  async function resolveWithGate(tx, d, uid, now, req) {
+    let info = resolveSpins(d, now, null);
+    let gate = null;
+    if (info.welcomeDue) {
+      gate = await welcomeGate(tx, uid, cleanIp(req.ip), getDeviceId(req));
+      info = resolveSpins(d, now, gate);
+    }
+    return { info, gate };
   }
 
   function fail(res, status, code) { return res.status(status).json({ success: false, error: code }); }
@@ -184,8 +245,9 @@ function registerSpinRoutes(app, { admin, db }) {
         const d = snap.data();
         if (d.banned === true) throw new Error('banned');
         const now = Date.now();
-        const info = resolveSpins(d, now);
+        const { info, gate } = await resolveWithGate(tx, d, uid, now, req);   // oxumalar yazmalardan əvvəl
         if (Object.keys(info.upd).length) tx.update(ref, info.upd);
+        if (info.welcomeGranted && gate && gate.ok) writeWelcomeClaims(tx, gate, uid);
         return publicState(d, info.upd, info.spins, info, now);
       });
       return res.json({ success: true, ...out });
@@ -206,7 +268,7 @@ function registerSpinRoutes(app, { admin, db }) {
         if (d.banned === true) throw new Error('banned');
 
         const now = Date.now();
-        const free = resolveSpins(d, now);
+        const { info: free, gate } = await resolveWithGate(tx, d, uid, now, req);
         if (free.spins < 1) throw new Error('no_spins');
 
         const idx = pickSegment(dep);
@@ -214,6 +276,7 @@ function registerSpinRoutes(app, { admin, db }) {
         Object.assign(upd, free.upd);          // welcomeSpinGiven / lastDailySpinAtMs eyni əməliyyatda yazılır
         upd.payWheelSpins = free.spins - 1 + (prize.type === 'spin' ? prize.value : 0);
         tx.update(ref, upd);
+        if (free.welcomeGranted && gate && gate.ok) writeWelcomeClaims(tx, gate, uid);
         tx.set(ref.collection('history').doc(), {
           type: 'bonus',
           amount: prize.type === 'money' ? prize.value : 0,
@@ -240,4 +303,4 @@ function registerSpinRoutes(app, { admin, db }) {
 
 module.exports = registerSpinRoutes;
 /* test üçün */
-module.exports._internals = { SEGMENTS, TOTAL_W, TOTAL_NW, FREE_SPIN_MS, MATRIX_POINTS, pickSegment, resolveSpins, applyPrize, isMatrix, welcomeDone };
+module.exports._internals = { SEGMENTS, TOTAL_W, TOTAL_NW, FREE_SPIN_MS, WELCOME_DELAY_MS, WELCOME_MAX_PER_IP, WELCOME_MAX_PER_DEVICE, MATRIX_POINTS, pickSegment, resolveSpins, applyPrize, isMatrix, welcomeDone };
