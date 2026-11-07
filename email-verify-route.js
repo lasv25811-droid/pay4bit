@@ -8,7 +8,6 @@ const RESEND_MS = 60 * 1000;
 const MAX_SENDS_PER_HOUR = 5;
 const MAX_ATTEMPTS = 5;
 const IP_MAX_PER_HOUR = 40;
-const EMAIL_BONUS_POINTS = 50;
 
 class HttpErr extends Error {
   constructor(status, message, extra) { super(message); this.status = status; this.extra = extra || {}; }
@@ -158,15 +157,18 @@ module.exports = function registerEmailVerifyRoutes(app, { admin, db }) {
         emailVerifiedFor: email,
         emailVerifiedAt: admin.firestore.FieldValue.serverTimestamp()
       };
-      let bonus = 0, points = Number(u.points) || 0;
-      if (u.emailBonus !== true) {
-        bonus = EMAIL_BONUS_POINTS;
-        points = Math.round((points + bonus) * 100) / 100;
-        upd.points = points;
-        upd.emailBonus = true;
+      let spinBonus = 0, spins = Math.max(0, Math.floor(Number(u.payWheelSpins) || 0));
+      if (u.emailSpinGiven !== true) {          // 1 PayÇarx, yalnız bir dəfə
+        spinBonus = 1; spins += 1;
+        upd.payWheelSpins = spins;
+        upd.emailSpinGiven = true;
+        tx.set(uref.collection('history').doc(), {
+          type: 'bonus', amount: 0, description: 'E-poçt doğrulama: 1 PayÇarx',
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
       }
       tx.update(uref, upd);
-      return { bonus, points };
+      return { spinBonus, spins };
     });
     await ref.delete().catch(() => {});
     return result;

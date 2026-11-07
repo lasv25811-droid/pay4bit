@@ -449,7 +449,13 @@ const OTP_LOCALE = process.env.OTP_LOCALE || '';          // məs: 'az' (boşdur
 const OTP_COOLDOWN_MS = 60 * 1000;                         // təkrar göndərmə arası
 const OTP_MAX_SENDS_PER_HOUR = 5;                          // bir istifadəçi üçün saatda
 const OTP_MAX_ATTEMPTS = 5;                                // bir kod üçün yanlış cəhd limiti
-const OTP_BONUS_POINTS = 50;
+// SMS API hələ qoşulmayıb: SMS_SIMULATE=true (və ya OTP_API_KEY boşdursa) kod serverdə təsadüfi yaradılır,
+// real SMS göndərilmir. Real API hazır olanda Render-də SMS_SIMULATE=false yazın və OTP_API_KEY əlavə edin.
+const SMS_SIMULATE = process.env.SMS_SIMULATE !== undefined && process.env.SMS_SIMULATE !== ''
+  ? String(process.env.SMS_SIMULATE).toLowerCase() === 'true'
+  : !OTP_API_KEY;
+const SIM_CODE_TTL_MS = 10 * 60 * 1000;
+const simHash = (uid, phone, code) => crypto.createHash('sha256').update(`${uid}|${phone}|${code}|yl-sms-sim`).digest('hex');
 const otpIpHits = new Map();                               // ip -> [vaxtlar] (SMS pumping qorunması)
 
 function normPhoneAz(raw) {
@@ -513,22 +519,27 @@ function otpIpAllowed(ip) {
 }
 const otpPick = (d, ...keys) => { for (const k of keys) if (d && d[k] !== undefined && d[k] !== null) return d[k]; return undefined; };
 
-// Doğrulama uğurlu olanda: phoneVerified=true + (ilk dəfə) +50 xal
+// Doğrulama uğurlu olanda: phoneVerified=true + (ilk dəfə) 1 PayÇarx
 async function otpFinalize(uid, phone) {
   const ref = db.collection('users').doc(uid);
-  let out = { bonus: 0, points: 0 };
+  let out = { bonus: 0, spinBonus: 0, spins: 0, points: 0 };
   await db.runTransaction(async tx => {
     const snap = await tx.get(ref);
     const u = snap.exists ? snap.data() : {};
     const upd = { phone, phoneVerified: true, phoneVerifiedAt: FieldValue.serverTimestamp() };
-    let points = Number(u.points) || 0;
-    if (!u.phoneBonus) {
-      upd.phoneBonus = true;
-      points = Math.round((points + OTP_BONUS_POINTS) * 100) / 100;
-      upd.points = points;
-      out.bonus = OTP_BONUS_POINTS;
+    let spins = Math.max(0, Math.floor(Number(u.payWheelSpins) || 0));
+    if (u.phoneSpinGiven !== true) {
+      spins += 1;
+      upd.payWheelSpins = spins;
+      upd.phoneSpinGiven = true;
+      upd.welcomeSpinGiven = true;   // qeydiyyat hədiyyəsi ilə ikiqat PayÇarx verilməsin
+      out.spinBonus = 1;
+      tx.set(ref.collection('history').doc(), {
+        type: 'bonus', amount: 0, description: 'Nömrə doğrulama: 1 PayÇarx', createdAt: FieldValue.serverTimestamp()
+      });
     }
-    out.points = points;
+    out.spins = spins;
+    out.points = Number(u.points) || 0;
     tx.update(ref, upd);
   });
   await db.collection('otpSessions').doc(uid).delete().catch(() => {});
@@ -566,6 +577,19 @@ async function otpSend(req, res, isResend) {
       if (wait > 0) return res.status(429).json({ success: false, error: `${Math.ceil(wait / 1000)} saniyə sonra yenidən göndərin`, retryAfter: Math.ceil(wait / 1000) });
     }
     if (sends.length >= OTP_MAX_SENDS_PER_HOUR) return res.status(429).json({ success: false, error: 'Saatlıq limit dolub, sonra yenidən cəhd edin' });
+
+    if (SMS_SIMULATE) {
+      const code = String(crypto.randomInt(100000, 1000000));
+      await sref.set({
+        simulated: true, codeHash: simHash(uid, phone, code), expiresAt: now + SIM_CODE_TTL_MS,
+        phone, sends: [...sends, now], attempts: 0, channel: 'sms', completion: 'code',
+        updatedAt: FieldValue.serverTimestamp()
+      });
+      return res.json({
+        success: true, simulated: true, code, completion: 'code', actionUrl: null,
+        channel: 'sms', maskedRecipient: '', phone, cooldown: OTP_COOLDOWN_MS / 1000
+      });
+    }
 
     // OTPBAY: POST /v1/verifications {to}. (Təkrar göndərmə də yeni doğrulama yaradır.)
     const r = await otpApi('POST', '/verifications', { to: phone });
@@ -606,6 +630,7 @@ app.get(['/otp/diag', '/api/otp/diag'], async (req, res) => {
     ok: r.status !== 401 && r.status !== 0,
     keyStatus, httpStatus: r.status, base: OTP_BASE,
     keyFromEnv: !!process.env.OTP_API_KEY,
+    simulate: SMS_SIMULATE,
     providerMessage: (r.data && r.data.error && r.data.error.message) || null
   });
 });
@@ -621,17 +646,24 @@ app.post(['/otp/verify', '/api/otp/verify'], authUser, async (req, res) => {
 
     const sref = db.collection('otpSessions').doc(uid);
     const s = (await sref.get()).data();
-    if (!s || !s.otpId) return res.status(400).json({ success: false, error: 'Əvvəlcə kod göndərin' });
+    if (!s || (!s.otpId && !s.simulated)) return res.status(400).json({ success: false, error: 'Əvvəlcə kod göndərin' });
     if ((s.attempts || 0) >= OTP_MAX_ATTEMPTS) return res.status(429).json({ success: false, error: 'Çox yanlış cəhd. Yeni kod göndərin' });
 
     const us = await db.collection('users').doc(uid).get();
     const u = us.exists ? us.data() : {};
-    if (u.phoneVerified === true) return res.json({ success: true, phone: u.phone || '', bonus: 0, points: Number(u.points) || 0 });
+    if (u.phoneVerified === true) return res.json({ success: true, phone: u.phone || '', bonus: 0, spinBonus: 0, points: Number(u.points) || 0 });
     if (normPhoneAz(u.phone) !== s.phone) return res.status(409).json({ success: false, error: 'Nömrə dəyişib, yenidən kod göndərin' });
 
-    const r = await otpApi('POST', '/verifications/' + encodeURIComponent(s.otpId) + '/check', { code });
-    if (!r.ok) return otpFail(res, r);
-    const matched = !!(r.data && (r.data.valid === true || r.data.approved === true || r.data.matched === true || r.data.status === 'approved'));
+    let matched = false;
+    if (s.simulated) {
+      if (Date.now() > Number(s.expiresAt || 0)) return res.status(400).json({ success: false, error: 'Kodun vaxtı bitib, yenidən göndərin' });
+      const x = Buffer.from(simHash(uid, s.phone, code)), y = Buffer.from(String(s.codeHash || ''));
+      matched = x.length === y.length && crypto.timingSafeEqual(x, y);
+    } else {
+      const r = await otpApi('POST', '/verifications/' + encodeURIComponent(s.otpId) + '/check', { code });
+      if (!r.ok) return otpFail(res, r);
+      matched = !!(r.data && (r.data.valid === true || r.data.approved === true || r.data.matched === true || r.data.status === 'approved'));
+    }
     if (!matched) {
       await sref.update({ attempts: FieldValue.increment(1) }).catch(() => {});
       const left = Math.max(0, OTP_MAX_ATTEMPTS - (s.attempts || 0) - 1);
@@ -655,7 +687,7 @@ app.get(['/otp/status', '/api/otp/status'], authUser, async (req, res) => {
   try {
     const uid = req.user.uid;
     const s = (await db.collection('otpSessions').doc(uid).get()).data();
-    if (!s || !s.otpId) return res.json({ success: true, status: 'none' });
+    if (!s || !s.otpId) return res.json({ success: true, status: s && s.simulated ? 'pending' : 'none' });
     const r = await otpApi('GET', '/verifications/' + encodeURIComponent(s.otpId));
     if (!r.ok) return otpFail(res, r);
     const st = r.data && r.data.status;
@@ -674,6 +706,9 @@ app.get(['/otp/status', '/api/otp/status'], authUser, async (req, res) => {
 
 // PayÇarx (fırlatma) marşrutları: /spin-state, /spin
 require('./spin-route')(app, { admin, db });
+
+// E-poçt doğrulama (Brevo ilə kod göndərir, uğurda 1 PayÇarx): /email-verify/send, /confirm
+require('./email-verify-route')(app, { admin, db });
 
 // Şifrə yeniləmə (e-mail kodu): /password-reset/lookup, /send, /confirm
 require('./password-reset-route')(app, { admin, db });
