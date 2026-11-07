@@ -1,22 +1,3 @@
-/**
- * Şifrə yeniləmə (e-mail kodu ilə) — Render serverinə əlavə marşrutlar.
- * Firebase Functions LAZIM DEYİL (Spark plan kifayətdir).
- *
- * Qoşulması server.js-də (artıq əlavə olunub):
- *   require('./password-reset-route')(app, { admin, db });
- *
- * Endpoint-lər (token tələb etmir, çünki istifadəçi şifrəni unudub):
- *   POST /password-reset/lookup   { nick }                          -> { masked }
- *   POST /password-reset/send     { nick }                          -> { ok }
- *   POST /password-reset/confirm  { nick, code, newPassword }       -> { ok }
- *   (hamısı /api/password-reset/... ilə də işləyir)
- *
- * E-mail göndərmə: Brevo HTTP API (Render pulsuz planda SMTP portları bağlıdır, HTTP işləyir).
- * Render → Environment bölməsinə yaz:
- *   BREVO_API_KEY = (Brevo → SMTP & API → API Keys)
- *   MAIL_FROM     = Brevo-da təsdiqlənmiş göndərən e-mail
- *   MAIL_FROM_NAME= YevroLato   (istəyə bağlı)
- */
 'use strict';
 const crypto = require('crypto');
 
@@ -103,13 +84,11 @@ module.exports = function registerPasswordResetRoutes(app, { admin, db }) {
     }
   };
 
-  /* 1) ləqəb -> maskalanmış e-mail */
   app.post(['/password-reset/lookup', '/api/password-reset/lookup'], wrap(async (b) => {
     const { email } = await findAccount(b.nick);
     return { masked: maskEmail(email) };
   }));
 
-  /* 2) kod yarat + e-mailə göndər */
   app.post(['/password-reset/send', '/api/password-reset/send'], wrap(async (b) => {
     const { uid, email } = await findAccount(b.nick);
     const ref = db.collection('passwordResets').doc(uid);
@@ -135,7 +114,6 @@ module.exports = function registerPasswordResetRoutes(app, { admin, db }) {
     return {};
   }));
 
-  /* 3) kod + yeni şifrə */
   app.post(['/password-reset/confirm', '/api/password-reset/confirm'], wrap(async (b) => {
     const { nick, code, newPassword } = b;
     if (typeof code !== 'string' || !/^\d{6}$/.test(code)) throw new HttpErr(400, 'Kod 6 rəqəm olmalıdır');
