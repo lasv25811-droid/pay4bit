@@ -449,11 +449,10 @@ const OTP_LOCALE = process.env.OTP_LOCALE || '';          // məs: 'az' (boşdur
 const OTP_COOLDOWN_MS = 60 * 1000;                         // təkrar göndərmə arası
 const OTP_MAX_SENDS_PER_HOUR = 5;                          // bir istifadəçi üçün saatda
 const OTP_MAX_ATTEMPTS = 5;                                // bir kod üçün yanlış cəhd limiti
-// SMS API hələ qoşulmayıb: SMS_SIMULATE=true (və ya OTP_API_KEY boşdursa) kod serverdə təsadüfi yaradılır,
+// SMS API hələ qoşulmayıb: SMS_SIMULATE=true kod serverdə təsadüfi yaradılır,
 // real SMS göndərilmir. Real API hazır olanda Render-də SMS_SIMULATE=false yazın və OTP_API_KEY əlavə edin.
-const SMS_SIMULATE = process.env.SMS_SIMULATE !== undefined && process.env.SMS_SIMULATE !== ''
-  ? String(process.env.SMS_SIMULATE).toLowerCase() === 'true'
-  : !OTP_API_KEY;
+// SMS_SIMULATE yalnız Render-də açıq şəkildə "false" yazılsa söndürülür (OTP_API_KEY olsa belə simulyasiya işləyir).
+const SMS_SIMULATE = String(process.env.SMS_SIMULATE || 'true').trim().toLowerCase() !== 'false';
 const SIM_CODE_TTL_MS = 10 * 60 * 1000;
 const simHash = (uid, phone, code) => crypto.createHash('sha256').update(`${uid}|${phone}|${code}|yl-sms-sim`).digest('hex');
 const otpIpHits = new Map();                               // ip -> [vaxtlar] (SMS pumping qorunması)
@@ -707,7 +706,7 @@ app.get(['/otp/status', '/api/otp/status'], authUser, async (req, res) => {
 // PayÇarx (fırlatma) marşrutları: /spin-state, /spin
 require('./spin-route')(app, { admin, db });
 
-// E-poçt doğrulama (Brevo ilə kod göndərir, uğurda 1 PayÇarx): /email-verify/send, /confirm
+// E-poçt doğrulama (Firebase-in öz məktubu, uğurda 1 PayÇarx): /email-verify/send, /confirm
 require('./email-verify-route')(app, { admin, db });
 
 // Şifrə yeniləmə (e-mail kodu): /password-reset/lookup, /send, /confirm
