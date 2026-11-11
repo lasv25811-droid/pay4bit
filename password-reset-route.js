@@ -75,7 +75,7 @@ module.exports = function registerPasswordResetRoutes(app, { admin, db }) {
 
   const wrap = fn => async (req, res) => {
     try {
-      if (!ipAllowed(req.ip)) throw new HttpErr(429, 'Çox cəhd edildi, sonra yenidən yoxlayın');
+      if (!ipAllowed(req.realIp || req.ip)) throw new HttpErr(429, 'Çox cəhd edildi, sonra yenidən yoxlayın');
       res.json({ success: true, ...(await fn(req.body || {})) });
     } catch (e) {
       if (e instanceof HttpErr) return res.status(e.status).json({ success: false, error: e.message });
@@ -126,12 +126,13 @@ module.exports = function registerPasswordResetRoutes(app, { admin, db }) {
     if (!snap.exists) throw new HttpErr(400, 'Əvvəlcə kod göndərin');
     const d = snap.data();
 
+    // Sənəd SİLİNMİR: saatlıq göndərmə sayğacı və gözləmə vaxtı qalır (əks halda limit sıfırlanıb kod təxmin etmək mümkün olardı)
     if (Date.now() > d.expiresAt) {
-      await ref.delete().catch(() => {});
+      await ref.update({ codeHash: '', attempts: MAX_ATTEMPTS }).catch(() => {});
       throw new HttpErr(400, 'Kodun vaxtı bitib. Yenidən kod göndərin');
     }
     if (d.attempts >= MAX_ATTEMPTS) {
-      await ref.delete().catch(() => {});
+      await ref.update({ codeHash: '' }).catch(() => {});
       throw new HttpErr(429, 'Çox yanlış cəhd. Yeni kod istəyin');
     }
     const a = Buffer.from(hashCode(uid, code)), c = Buffer.from(d.codeHash);

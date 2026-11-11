@@ -1,0 +1,12 @@
+Render -> Environment -> bunları əlavə edin (açarları KODDA və ya çatda yazmayın):
+
+BETATRANSFER_PUBLIC_KEY      = <4775f37f3c16435e65a0cc573e6442e4
+>
+BETATRANSFER_SECRET_KEY      = <bc43a73655f27ae131197fcf6a682b86
+>
+BETATRANSFER_PAYMENT_SYSTEM  = <Azərbaycan kart-to-kart paymentSystem kodu>   (menecerdən / GET /api/payment-system)
+BETATRANSFER_CALLBACK_BASE   = https://pay4bit.onrender.com                   (serverinizin ünvanı)
+SITE_URL                     = https://yevrolato.com
+# istəyə bağlı:
+BETATRANSFER_CURRENCY=AZN  BETATRANSFER_MIN=5  BETATRANSFER_MAX=2000
+BETATRANSFER_SIGN_FIELDS=amount,currency,orderId,paymentSystem,urlResult,urlSuccess,urlFail,payerId

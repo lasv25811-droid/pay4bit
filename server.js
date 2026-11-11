@@ -94,6 +94,15 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
+// ---- Real istifadəçi IP-si (Render/Cloudflare arxasında req.ip hamı üçün eyni proksi IP-si ola bilər) ----
+function getClientIp(req) {
+  const h = req.headers || {};
+  const pick = v => String(Array.isArray(v) ? v[0] : (v || '')).split(',')[0].trim();
+  const ip = pick(h['cf-connecting-ip']) || pick(h['true-client-ip']) || String(req.ip || '');
+  return ip.replace(/^::ffff:/i, '');
+}
+app.use((req, res, next) => { req.realIp = getClientIp(req); next(); });
+
 // ---- Təhlükəsizlik başlıqları ----
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -104,23 +113,38 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Ümumi sorğu limiti (IP başına dəqiqədə 240; callback və health istisna) ----
+// ---- CORS (limitdən ƏVVƏL: 429/xəta cavabları da brauzerə çatsın, "server ilə əlaqə yoxdur" görünməsin) ----
+function originAllowed(origin) {
+  if (!origin || !ALLOWED_ORIGINS.length) return true;
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  try {
+    const host = new URL(origin).hostname.toLowerCase();
+    const bare = h => h.replace(/^www\./, '');
+    if (/^yevrolatotest\.(web\.app|firebaseapp\.com)$/.test(host)) return true;
+    return ALLOWED_ORIGINS.some(o => { try { return bare(new URL(o).hostname.toLowerCase()) === bare(host); } catch (_) { return false; } });
+  } catch (_) { return false; }
+}
+app.use(cors({
+  origin: (origin, cb) => cb(null, originAllowed(origin)),
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400
+}));
+
+// ---- Ümumi sorğu limiti (hər real IP üçün dəqiqədə; callback, health və OPTIONS istisna) ----
+const GLOBAL_LIMIT = Math.max(60, Number(process.env.RATE_LIMIT_PER_MIN) || 600);
 const globalHits = new Map();
 setInterval(() => { const now = Date.now(); for (const [k, v] of globalHits) if (now - v.t > 60000) globalHits.delete(k); }, 60000).unref();
 app.use((req, res, next) => {
-  if (req.path === '/pay4bit/callback' || req.path === '/health' || req.path === '/api/health') return next();
-  const ip = String(req.ip || '');
+  if (req.method === 'OPTIONS' || req.path === '/pay4bit/callback' || req.path === '/betatransfer/callback' || req.path === '/health' || req.path === '/api/health') return next();
+  const ip = String(req.realIp || req.ip || '');
   const now = Date.now();
   let e = globalHits.get(ip);
   if (!e || now - e.t > 60000) e = { t: now, n: 0 };
   e.n++; globalHits.set(ip, e);
-  if (e.n > 240) return res.status(429).json({ success: false, error: 'Çox sorğu, bir az sonra yoxlayın' });
+  if (e.n > GLOBAL_LIMIT) return res.status(429).json({ success: false, error: 'Çox sorğu, bir az sonra yoxlayın' });
   next();
 });
-app.use(cors({
-  origin: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : true,
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
 app.use(express.json({ limit: '20kb' }));
 app.use(express.urlencoded({ extended: true, limit: '20kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -218,7 +242,7 @@ function uidLimit(tag, max, windowMs) {
 const cbHits = new Map();
 setInterval(() => { const now = Date.now(); for (const [k, v] of cbHits) if (now - v.t > 60000) cbHits.delete(k); }, 60000).unref();
 function callbackLimit(req, res, next) {
-  const ip = String(req.ip || ''), now = Date.now();
+  const ip = String(req.realIp || req.ip || ''), now = Date.now();
   let e = cbHits.get(ip);
   if (!e || now - e.t > 60000) e = { t: now, n: 0 };
   e.n++; cbHits.set(ip, e);
@@ -373,12 +397,16 @@ async function pay4bitCallback(req, res) {
         const userRef = db.collection('users').doc(order.uid);
         const userSnap = await tx.get(userRef);
         const u = userSnap.exists ? userSnap.data() : {};
-        let poolSnap = null, secretSnap = null;
+        let poolDoc = null, poolCode = '';
         if (purpose === 'code') {
-          poolSnap = await tx.get(db.collection('fastlotoCodes')
-            .where('amount', '==', order.aznAmount).where('status', '==', 'available').limit(1));
-          // Kodun özü fastlotoSecrets/{id}-də saxlanır (admin paneli belə yazır)
-          if (!poolSnap.empty) secretSnap = await tx.get(db.collection('fastlotoSecrets').doc(poolSnap.docs[0].id));
+          const ps = await tx.get(db.collection('fastlotoCodes')
+            .where('amount', '==', order.aznAmount).where('status', '==', 'available').limit(10));
+          // Kodun özü fastlotoSecrets/{id}-də saxlanır (admin paneli belə yazır). Kodu boş/oxunmayan sənədlər keçilir.
+          for (const dd of ps.docs) {
+            const sd = await tx.get(db.collection('fastlotoSecrets').doc(dd.id));
+            const c = String((sd.exists && sd.data().code) || dd.data().code || '').trim();
+            if (c) { poolDoc = dd; poolCode = c; break; }
+          }
         }
 
         // ---- 2027 kampaniya: bu istifadəçinin kodu varmı? yoxdursa boş kod seç ----
@@ -434,9 +462,8 @@ async function pay4bitCallback(req, res) {
         }
 
         if (purpose === 'code') {
-          if (poolSnap && !poolSnap.empty) {
-            const poolDoc = poolSnap.docs[0];
-            const codeStr = String((secretSnap && secretSnap.exists && secretSnap.data().code) || poolDoc.data().code || '');
+          if (poolDoc) {
+            const codeStr = poolCode;
             tx.update(poolDoc.ref, {
               status: 'used', usedByUid: order.uid,
               usedByUniqueId: u.uniqueId || '', usedAt: FieldValue.serverTimestamp()
@@ -491,6 +518,7 @@ const SMS_SIMULATE = String(process.env.SMS_SIMULATE || 'true').trim().toLowerCa
 const SIM_CODE_TTL_MS = 10 * 60 * 1000;
 if (SMS_SIMULATE) console.warn('[təhlükəsizlik] SMS_SIMULATE aktivdir: təsdiq kodu cavabda qaytarılır, nömrə həqiqətən doğrulanmır. Real SMS qoşulanda Render-də SMS_SIMULATE=false yazın.');
 const simHash = (uid, phone, code) => crypto.createHash('sha256').update(`${uid}|${phone}|${code}|yl-sms-sim`).digest('hex');
+const OTP_IP_MAX_PER_HOUR = Math.max(20, Number(process.env.OTP_IP_MAX_PER_HOUR) || 60);
 const otpIpHits = new Map();                               // ip -> [vaxtlar] (SMS pumping qorunması)
 
 function normPhoneAz(raw) {
@@ -548,7 +576,7 @@ const cleanIp = ip => String(ip || '').replace(/^::ffff:/i, '');
 function otpIpAllowed(ip) {
   const now = Date.now();
   const arr = (otpIpHits.get(ip) || []).filter(t => now - t < 3600000);
-  if (arr.length >= 20) { otpIpHits.set(ip, arr); return false; }
+  if (arr.length >= OTP_IP_MAX_PER_HOUR) { otpIpHits.set(ip, arr); return false; }
   arr.push(now); otpIpHits.set(ip, arr);
   return true;
 }
@@ -584,7 +612,7 @@ async function otpFinalize(uid, phone) {
 async function otpSend(req, res, isResend) {
   try {
     const uid = req.user.uid;
-    if (!otpIpAllowed(req.ip)) return res.status(429).json({ success: false, error: 'Çox cəhd edildi, sonra yenidən yoxlayın' });
+    if (!otpIpAllowed(req.realIp || req.ip)) return res.status(429).json({ success: false, error: 'Çox cəhd edildi, sonra yenidən yoxlayın' });
 
     const us = await db.collection('users').doc(uid).get();
     if (!us.exists) return res.status(404).json({ success: false, error: 'İstifadəçi tapılmadı' });
@@ -655,7 +683,7 @@ async function otpSend(req, res, isResend) {
 // Diaqnostika: açar işləyirmi? (brauzerdə aç: /api/otp/diag) — SMS göndərmir
 app.get(['/otp/diag', '/api/otp/diag'], async (req, res) => {
   if (!process.env.DIAG_TOKEN || !safeEq(req.headers['x-diag-token'], process.env.DIAG_TOKEN)) return res.status(404).json({ success: false });
-  if (!otpIpAllowed(req.ip)) return res.status(429).json({ ok: false });
+  if (!otpIpAllowed(req.realIp || req.ip)) return res.status(429).json({ ok: false });
   const r = await otpApi('GET', '/verifications/VE00000000000000000000000000000000');
   if (!OTP_API_KEY) return res.json({ ok: false, keyStatus: 'MISSING (Render-də OTP_API_KEY yoxdur)', base: OTP_BASE });
   const keyStatus = r.status === 401 ? 'INVALID (açar yanlışdır / tətbiq söndürülüb / şirkət dayandırılıb)'
@@ -739,6 +767,127 @@ app.get(['/otp/status', '/api/otp/status'], authUser, async (req, res) => {
   }
 });
 
+// ---------- Balansla kod alışı (server tərəfi, Admin SDK) ----------
+// Brauzer tərəfi Firestore qaydaları/indekslərdən asılı olub "xəta" verirdi. Burada hamısı bir atomik əməliyyatdır:
+// balans yoxlanır -> hovuzdan kodu OLAN sənəd seçilir -> balans çıxılır -> kod istifadəçiyə yazılır.
+const round2g = n => Math.round((Number(n) || 0) * 100) / 100;
+app.post(['/buy-code', '/api/buy-code'], authUser, uidLimit('buy', 12, 60000), async (req, res) => {
+  try {
+    const platform = req.body.platform === 'chcplay' ? 'chcplay' : 'fastloto';
+    const raw = String(req.body.amount ?? '').trim().replace(',', '.');
+    if (!/^\d+(\.\d{1,2})?$/.test(raw)) return res.status(400).json({ success: false, error: 'Məbləğ yanlışdır' });
+    const amount = round2g(raw);
+    if (!(amount > 0) || amount > MAX_AZN) return res.status(400).json({ success: false, error: 'Məbləğ yanlışdır' });
+    const uid = req.user.uid;
+
+    const out = await db.runTransaction(async tx => {
+      const userRef = db.collection('users').doc(uid);
+      const userSnap = await tx.get(userRef);
+      if (!userSnap.exists) throw new Error('user_not_found');
+      const u = userSnap.data();
+      if (u.banned === true) throw new Error('banned');
+      const bal = Number(u.balance) || 0;
+      if (bal + 0.0001 < amount) throw new Error('balance');
+
+      const ps = await tx.get(db.collection('fastlotoCodes')
+        .where('amount', '==', amount).where('status', '==', 'available').limit(10));
+      let poolDoc = null, codeStr = '';
+      for (const dd of ps.docs) {
+        const sd = await tx.get(db.collection('fastlotoSecrets').doc(dd.id));
+        const c = String((sd.exists && sd.data().code) || dd.data().code || '').trim();
+        if (c) { poolDoc = dd; codeStr = c; break; }
+      }
+      if (!poolDoc) return { noCode: true };
+
+      const nb = round2g(bal - amount);
+      tx.update(poolDoc.ref, {
+        status: 'used', usedByUid: uid, usedByUniqueId: String(u.uniqueId || ''), usedAt: FieldValue.serverTimestamp()
+      });
+      tx.update(userRef, { balance: nb, spendRef: 'p:' + poolDoc.id });
+      tx.set(userRef.collection('codes').doc('pool_' + poolDoc.id), {
+        code: codeStr, platform, amount, source: 'pool', status: 'active', createdAt: FieldValue.serverTimestamp()
+      });
+      tx.set(userRef.collection('history').doc('pool_' + poolDoc.id), {
+        type: 'withdraw', amount: -amount,
+        description: platform.toUpperCase() + ' Kod Alışı (Balans)', createdAt: FieldValue.serverTimestamp()
+      });
+      return { code: codeStr, balance: nb };
+    });
+
+    if (out.noCode) return res.json({ success: true, status: 'no_code' });
+    return res.json({ success: true, status: 'delivered', code: out.code, balance: out.balance, amount, platform });
+  } catch (e) {
+    const m = e && e.message;
+    if (m === 'balance') return res.status(409).json({ success: false, error: 'balance' });
+    if (m === 'banned') return res.status(403).json({ success: false, error: 'banned' });
+    if (m === 'user_not_found') return res.status(404).json({ success: false, error: 'user_not_found' });
+    console.error('[buy-code]', e);
+    return res.status(500).json({ success: false, error: 'server_error' });
+  }
+});
+
+// ---------- Admin əməliyyatları (balans düzəlişi / çarx vermə) ----------
+// Yalnız aktiv TAM admin (role != 'support') və ya super admin. Admin SDK qaydalardan asılı deyil.
+const SUPER_ADMIN_UID = process.env.SUPER_ADMIN_UID || 'dIxZVPfOLIPZW0xqtcTeg7JXRnN2';
+async function requireFullAdmin(req, res, next) {
+  try {
+    const uid = req.user.uid;
+    if (uid !== SUPER_ADMIN_UID) {
+      const s = await db.collection('admins').doc(uid).get();
+      const d = s.exists ? s.data() : null;
+      if (!d || d.active !== true || d.role === 'support') return res.status(403).json({ success: false, error: 'İcazə yoxdur' });
+    }
+    next();
+  } catch (e) { console.error('[admin-auth]', e); res.status(500).json({ success: false, error: 'server_error' }); }
+}
+function adminErr(res, e, tag) {
+  const m = e && e.message;
+  if (m === 'user_not_found') return res.status(404).json({ success: false, error: 'İstifadəçi tapılmadı' });
+  if (m === 'negative') return res.status(400).json({ success: false, error: 'Balans mənfi ola bilməz' });
+  console.error(tag, e);
+  return res.status(500).json({ success: false, error: 'server_error' });
+}
+app.post(['/admin/adjust-balance', '/api/admin/adjust-balance'], authUser, uidLimit('adm', 60, 60000), requireFullAdmin, async (req, res) => {
+  try {
+    const target = String(req.body.uid || '').trim();
+    const amt = round2g(req.body.amount);
+    const why = String(req.body.reason || 'Admin düzəlişi').slice(0, 200);
+    if (!target || target.length > 128 || !amt || Math.abs(amt) > 100000) return res.status(400).json({ success: false, error: 'Məbləğ yanlışdır' });
+    const ref = db.collection('users').doc(target);
+    let nb = 0;
+    await db.runTransaction(async tx => {
+      const s = await tx.get(ref);
+      if (!s.exists) throw new Error('user_not_found');
+      nb = round2g((Number(s.data().balance) || 0) + amt);
+      if (nb < 0) throw new Error('negative');
+      tx.update(ref, { balance: nb });
+      tx.set(ref.collection('history').doc(), {
+        type: amt >= 0 ? 'deposit' : 'withdraw', amount: amt, description: why, createdAt: FieldValue.serverTimestamp()
+      });
+    });
+    res.json({ success: true, balance: nb });
+  } catch (e) { adminErr(res, e, '[admin-adjust-balance]'); }
+});
+app.post(['/admin/give-spins', '/api/admin/give-spins'], authUser, uidLimit('adm', 60, 60000), requireFullAdmin, async (req, res) => {
+  try {
+    const target = String(req.body.uid || '').trim();
+    const n = Math.floor(Number(req.body.count));
+    if (!target || target.length > 128 || !(n >= 1 && n <= 100)) return res.status(400).json({ success: false, error: '1–100 arası yazın' });
+    const ref = db.collection('users').doc(target);
+    let spins = 0;
+    await db.runTransaction(async tx => {
+      const s = await tx.get(ref);
+      if (!s.exists) throw new Error('user_not_found');
+      spins = Math.max(0, Math.floor(Number(s.data().payWheelSpins) || 0)) + n;
+      tx.update(ref, { payWheelSpins: spins });
+    });
+    res.json({ success: true, spins });
+  } catch (e) { adminErr(res, e, '[admin-give-spins]'); }
+});
+
+// BetaTransfer (kart-to-kart depozit): /betatransfer/create, /status, /callback
+require('./betatransfer-route')(app, { admin, db, authUser, uidLimit, callbackLimit, genYeKod, campaignActive });
+
 // PayÇarx (fırlatma) marşrutları: /spin-state, /spin
 require('./spin-route')(app, { admin, db });
 
@@ -754,6 +903,7 @@ app.get('/', (req, res) => res.json({ ok: true }));
 app.use((req, res) => res.status(404).json({ success: false, error: 'Tapılmadı' }));
 app.use((err, req, res, next) => { console.error('[express]', err); res.status(500).json({ success: false, error: 'Server xətası' }); });
 process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
+process.on('uncaughtException', e => console.error('[uncaughtException]', e));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server ${PORT} portunda işləyir`));

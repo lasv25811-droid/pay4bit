@@ -81,7 +81,7 @@ module.exports = function registerEmailVerifyRoutes(app, { admin, db }) {
 
   const wrap = fn => async (req, res) => {
     try {
-      if (!ipAllowed(req.ip)) throw new HttpErr(429, 'Çox cəhd edildi, sonra yenidən yoxlayın');
+      if (!ipAllowed(req.realIp || req.ip)) throw new HttpErr(429, 'Çox cəhd edildi, sonra yenidən yoxlayın');
       const uid = await authUid(req);
       res.json({ success: true, ...(await fn(uid, req.body || {})) });
     } catch (e) {
@@ -138,7 +138,11 @@ module.exports = function registerEmailVerifyRoutes(app, { admin, db }) {
 
   /* ---------- 2) Firebase-də doğrulandımı? -> doğrula + 1 PayÇarx ---------- */
   app.post(['/email-verify/confirm', '/api/email-verify/confirm'], wrap(async (uid) => {
-    const { email } = await loadUser(uid);
+    const { data: cu, email } = await loadUser(uid);
+    // Artıq doğrulanıbsa (iki dəfə toxunma / təkrar sorğu) xəta yox, uğur qaytar
+    if (cu.emailVerified === true && String(cu.emailVerifiedFor || '') === email) {
+      return { spinBonus: 0, spins: Math.max(0, Math.floor(Number(cu.payWheelSpins) || 0)) };
+    }
     const ref = db.collection('emailVerifications').doc(uid);
     const snap = await ref.get();
     if (!snap.exists || snap.data().email !== email) throw new HttpErr(400, 'Əvvəlcə doğrulama məktubu göndərin');
