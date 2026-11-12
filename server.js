@@ -33,7 +33,6 @@ const FIREBASE_SA = null;
 const PAY4BIT_URL = 'https://api.pay4bit.net/pay';
 const CHARGE_CURRENCY = 'EUR';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-if (!ALLOWED_ORIGINS.length) console.warn('[təhlükəsizlik] ALLOWED_ORIGINS boşdur — CORS hər domenə açıqdır. Render-də ALLOWED_ORIGINS=https://saytiniz.az,https://www.saytiniz.az yazın.');
 // PAY callback-də yalnız md5 `sign` (localpayId + secret) qəbul olunur. check_sign istifadəçiyə ödəniş linkində göründüyü üçün
 // onunla PAY qəbul etmək saxta ödənişə yol açır. Pay4bit yalnız check_sign göndərirsə (nadir) 'false' yazın — amma bu TƏHLÜKƏLİDİR.
 const PAY_REQUIRE_SIGN = String(process.env.PAY4BIT_PAY_REQUIRE_SIGN || 'true').trim().toLowerCase() !== 'false';
@@ -114,22 +113,10 @@ app.use((req, res, next) => {
 });
 
 // ---- CORS (limitdən ƏVVƏL: 429/xəta cavabları da brauzerə çatsın, "server ilə əlaqə yoxdur" görünməsin) ----
-function originAllowed(origin) {
-  if (!origin || !ALLOWED_ORIGINS.length) return true;
-  if (ALLOWED_ORIGINS.includes(origin)) return true;
-  try {
-    const host = new URL(origin).hostname.toLowerCase();
-    const bare = h => h.replace(/^www\./, '');
-    if (/^yevrolatotest\.(web\.app|firebaseapp\.com)$/.test(host)) return true;
-    return ALLOWED_ORIGINS.some(o => { try { return bare(new URL(o).hostname.toLowerCase()) === bare(host); } catch (_) { return false; } });
-  } catch (_) { return false; }
-}
-app.use(cors({
-  origin: (origin, cb) => cb(null, originAllowed(origin)),
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  maxAge: 86400
-}));
+// Bütün sorğular Authorization: Bearer token ilə gedir (cookie YOXDUR) -> CORS-u məhdudlaşdırmaq təhlükəsizlik vermir,
+// amma yanlış ALLOWED_ORIGINS brauzerdə "server cavab vermir" xətasına çevrilirdi. Ona görə origin həmişə qəbul olunur.
+app.use(cors({ origin: true, methods: ['GET', 'POST', 'OPTIONS'], maxAge: 86400 }));
+
 
 // ---- Ümumi sorğu limiti (hər real IP üçün dəqiqədə; callback, health və OPTIONS istisna) ----
 const GLOBAL_LIMIT = Math.max(60, Number(process.env.RATE_LIMIT_PER_MIN) || 600);
@@ -148,6 +135,20 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '20kb' }));
 app.use(express.urlencoded({ extended: true, limit: '20kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ---- Sorğu taymauti: heç bir sorğu sonsuz asılı qalmasın (brauzer 60 san gözləməsin) ----
+app.use((req, res, next) => {
+  if (req.path === '/pay4bit/callback' || req.path === '/betatransfer/callback') return next();
+  const t = setTimeout(() => {
+    if (!res.headersSent) {
+      console.error('[timeout] cavab 45 saniyədə hazır olmadı:', req.method, req.path);
+      res.status(503).json({ success: false, error: 'Server məşğuldur, bir az sonra yenidən cəhd edin' });
+    }
+  }, 45000);
+  res.on('finish', () => clearTimeout(t));
+  res.on('close', () => clearTimeout(t));
+  next();
+});
 
 // ---------- Aktiv məzənnə (AZN -> EUR) ----------
 let rateCache = { aznPerEur: null, at: 0, source: null };
@@ -214,6 +215,7 @@ function safeEq(a, b) {
   a = Buffer.from(String(a || '')); b = Buffer.from(String(b || ''));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+const eqHex = (a, b) => safeEq(String(a || '').toLowerCase(), String(b || '').toLowerCase());
 async function authUser(req, res, next) {
   try {
     const h = req.headers.authorization || '';
@@ -317,16 +319,21 @@ app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 1
 
 // ---------- Ödəniş statusu (istifadəçi geri qayıdanda) ----------
 app.get(['/payment-status', '/api/payment-status'], authUser, async (req, res) => {
-  const snap = await db.collection('payments').doc(String(req.query.order || '')).get();
-  if (!snap.exists || snap.data().uid !== req.user.uid) return res.status(404).json({ success: false });
-  const d = snap.data();
-  res.json({
-    success: true, status: d.status, azn: d.aznAmount,
-    purpose: d.purpose || 'code', bonus: d.bonus || 0,
-    codeStatus: d.codeStatus || null,            // 'delivered' | 'admin_pending'
-    code: d.codeStatus === 'delivered' ? d.code : null,
-    codeRequestId: d.codeRequestId || null
-  });
+  try {
+    const snap = await db.collection('payments').doc(String(req.query.order || '')).get();
+    if (!snap.exists || snap.data().uid !== req.user.uid) return res.status(404).json({ success: false });
+    const d = snap.data();
+    res.json({
+      success: true, status: d.status, azn: d.aznAmount,
+      purpose: d.purpose || 'code', bonus: d.bonus || 0,
+      codeStatus: d.codeStatus || null,            // 'delivered' | 'admin_pending'
+      code: d.codeStatus === 'delivered' ? d.code : null,
+      codeRequestId: d.codeRequestId || null
+    });
+  } catch (e) {
+    console.error('[payment-status]', e && e.message ? e.message : e);
+    res.status(500).json({ success: false, error: 'server_error' });
+  }
 });
 
 // ---------- 2027 Yeni İl Kampaniyası (YeKod) ----------
@@ -351,32 +358,56 @@ function campaignActive() {
 async function pay4bitCallback(req, res) {
   const reply = (message, code = 200) => res.status(code).json({ result: { message } });
   try {
-    const q = { ...req.query, ...req.body };
-    const method = String(q.method || '').toLowerCase();
-    const p = q.params || {};
-    const account = String(p.account || '');
-    const amount = String(p.amount || '');
-    const desc = String(p.desc || '');
-
-    const okCheck = p.check_sign && safeEq(sha256(desc + account + amount + SECRET_KEY), p.check_sign);
-    const okSign = p.sign && p.localpayId && safeEq(md5(String(p.localpayId) + account + String(p.sum) + SECRET_KEY), p.sign);
-    if (!okCheck && !okSign) { console.warn('[callback] imza səhvdir', account); return reply('Invalid signature', 400); }
-    // PAY yalnız md5 `sign` ilə təsdiqlənir (check_sign istifadəçiyə məlumdur -> saxtalaşdırıla bilər)
-    if (method === 'pay' && PAY_REQUIRE_SIGN && !okSign) {
-      console.warn('[callback] PAY üçün md5 sign tələb olunur, yalnız check_sign gəldi', account);
-      return reply('Invalid signature', 400);
+    const q = { ...(req.query || {}), ...(req.body || {}) };
+    let p = q.params;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch (_) { p = null; } }
+    if (!p || typeof p !== 'object') {            // params[account] kimi düz açarlar və ya params yoxdur
+      p = {};
+      for (const k of Object.keys(q)) { const m = k.match(/^params\[(.+)\]$/); if (m) p[m[1]] = q[k]; }
+      if (!Object.keys(p).length) p = q;
     }
+    const method = String(q.method || p.method || '').toLowerCase();
+    const str = v => (v === undefined || v === null) ? '' : String(v);
+    const account = str(p.account);
+    const desc = str(p.desc);
+    const uniq = arr => [...new Set(arr.filter(x => x !== ''))];
+
+    // Pay4bit hansı sahədə məbləği imzalayıbsa (sum / amount / orderSum / payerSum) onu tapırıq
+    let signedSum = null, signedAmt = null;
+    if (p.sign && p.localpayId) {
+      for (const sv of uniq([str(p.sum), str(p.amount), str(p.orderSum), str(p.payerSum)])) {
+        if (eqHex(md5(str(p.localpayId) + account + sv + SECRET_KEY), p.sign)) { signedSum = sv; break; }
+      }
+    }
+    if (p.check_sign) {
+      for (const sv of uniq([str(p.amount), str(p.sum)])) {
+        if (eqHex(sha256(desc + account + sv + SECRET_KEY), p.check_sign)) { signedAmt = sv; break; }
+      }
+    }
+    const okSign = signedSum !== null, okCheck = signedAmt !== null;
+    console.log(`[callback] method=${method} account=${account} sign=${okSign} check_sign=${okCheck} keys=${Object.keys(p).join(',')}`);
+
+    if (!okCheck && !okSign) { console.warn('[callback] imza səhvdir', account); return reply('Invalid signature', 400); }
 
     const ref = db.collection('payments').doc(account);
     const snap = await ref.get();
     if (!snap.exists) return reply('Order not found', 404);
     const order = snap.data();
 
-    // İmzalanmış məbləği yoxla (check_sign -> amount, sign -> sum). Valyuta yalnız göndərilibsə yoxlanılır.
-    const signedAmount = (method === 'pay' && PAY_REQUIRE_SIGN) ? String(p.sum || '') : (okCheck ? amount : String(p.sum || ''));
+    // PAY yalnız md5 `sign` ilə təsdiqlənir (check_sign istifadəçiyə məlumdur -> saxtalaşdırıla bilər)
+    if (method === 'pay' && PAY_REQUIRE_SIGN && !okSign) {
+      console.warn('[callback] PAY rədd edildi: md5 sign yoxdur/yanlışdır, yalnız check_sign gəldi', account);
+      await ref.update({ cbIssue: 'pay_needs_md5_sign', cbIssueAt: FieldValue.serverTimestamp() }).catch(() => {});
+      return reply('Invalid signature', 400);
+    }
+
+    // İmzalanmış məbləğ sifarişdəki məbləğə (Pay4bit-ə göndərilən və ya komissiya daxil ödənilən) uyğun olmalıdır
+    const signed = okSign ? signedSum : signedAmt;
+    const expected = [order.chargeAmount, order.payerTotalEur].filter(x => x !== undefined && x !== null && x !== '').map(x => Number(x).toFixed(2));
     const curr = String(p.currency || '').toUpperCase();
-    if (Number(signedAmount).toFixed(2) !== order.chargeAmount || (curr && curr !== order.chargeCurrency)) {
-      console.warn('[callback] məbləğ uyğunsuzluğu', account, signedAmount, p.currency);
+    if (!expected.includes(Number(signed).toFixed(2)) || (curr && curr !== order.chargeCurrency)) {
+      console.warn('[callback] məbləğ uyğunsuzluğu', account, 'gələn:', signed, curr, 'gözlənilən:', expected.join('/'), order.chargeCurrency);
+      await ref.update({ cbIssue: 'amount_mismatch:' + signed + ' ' + curr, cbIssueAt: FieldValue.serverTimestamp() }).catch(() => {});
       return reply('Amount mismatch', 400);
     }
 
@@ -900,6 +931,20 @@ require('./password-reset-route')(app, { admin, db });
 // Son çıxarışlar (ana səhifə, yalnız real təsdiqlənmiş çıxarışlar, maskalanmış): /recent-payouts
 require('./payouts-route')(app, { db });
 
+function withTimeout(promise, ms) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout ' + ms + 'ms')), ms))]);
+}
+async function fsPing() {
+  const t = Date.now();
+  await withTimeout(db.collection('_health').doc('ping').get(), 25000);
+  return Date.now() - t;
+}
+// Dərin yoxlama (cron üçün YOX, diaqnostika üçün): Firestore cavab verirmi?
+app.get(['/health/deep', '/api/health/deep'], async (req, res) => {
+  try { res.json({ ok: true, firestoreMs: await fsPing() }); }
+  catch (e) { res.status(503).json({ ok: false, error: String(e && e.message || e) }); }
+});
+
 app.get(['/health', '/api/health'], (req, res) => res.json({ ok: true }));
 app.get('/', (req, res) => res.json({ ok: true }));
 
@@ -909,8 +954,16 @@ process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
 process.on('uncaughtException', e => console.error('[uncaughtException]', e));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server ${PORT} portunda işləyir`));
+const server = app.listen(PORT, '0.0.0.0', () => console.log(`Server ${PORT} portunda işləyir`));
+// Render-in proksisi bağlantını təkrar istifadə edir; Node-un 5 saniyəlik default-u təsadüfi 502 / "server cavab vermir" yaradırdı
+server.keepAliveTimeout = 120 * 1000;
+server.headersTimeout = 125 * 1000;
 
-// Render pulsuz planda yatmasın deyə hər 10 dəqiqədən bir özünü çağırır
+// ---- Firestore / Auth "isti" saxlanılır (soyuq start və boş qalmış gRPC bağlantısı ilk sorğunu 30-60 san asırdı) ----
+fsPing().then(ms => console.log('[warmup] Firestore hazırdır,', ms, 'ms')).catch(e => console.warn('[warmup] Firestore:', e.message));
+withTimeout(admin.auth().getUserByEmail('warmup@yevroloto.app'), 25000).catch(() => {});
+setInterval(() => { fsPing().catch(e => console.warn('[keepwarm] Firestore:', e.message)); }, 4 * 60 * 1000);
+
+// Render pulsuz planda yatmasın deyə hər 4 dəqiqədən bir özünü çağırır (kənar cron ilə birlikdə)
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || '';
-if (SELF_URL) setInterval(() => { fetch(SELF_URL + '/health', { signal: AbortSignal.timeout(15000) }).catch(() => {}); }, 10 * 60 * 1000);
+if (SELF_URL) setInterval(() => { fetch(SELF_URL + '/health', { signal: AbortSignal.timeout(15000) }).catch(() => {}); }, 4 * 60 * 1000);
