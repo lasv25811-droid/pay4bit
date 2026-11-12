@@ -5,8 +5,8 @@
  * Yalnız maskalanmış ad və məbləğ qaytarılır (uid, kart, tam ad YOXDUR). Nəticə 60 saniyə yaddaşda saxlanır.
  * Kompozit indeks tələb etmir: createdAt üzrə son sənədlər oxunur, "approved" yaddaşda süzülür.
  */
-const CACHE_MS = 60 * 1000;
-const SCAN = 80;      // son neçə çıxarış sorğusuna baxılsın
+const CACHE_MS = 10 * 60 * 1000;   // 10 dəqiqə (Firestore oxu limitinə qənaət)
+const SCAN = 40;      // son neçə çıxarış sorğusuna baxılsın
 const MAX_ITEMS = 12;
 
 function maskName(raw) {
@@ -50,10 +50,11 @@ module.exports = function registerPayoutRoutes(app, { db }) {
         pending = pending || load().finally(() => { pending = null; });
         cache = { at: Date.now(), items: await pending };
       }
-      res.set('Cache-Control', 'public, max-age=30');
+      res.set('Cache-Control', 'public, max-age=300');
       res.json({ success: true, items: cache.items });
     } catch (e) {
       console.error('[recent-payouts]', e && e.message ? e.message : e);
+      cache.at = Date.now() - CACHE_MS + 60 * 1000;            // xəta olsa 1 dəqiqə sonra yenidən cəhd (Firestore-u döymə)
       res.json({ success: true, items: cache.items || [] });   // xəta olsa səhifə sınmasın
     }
   });

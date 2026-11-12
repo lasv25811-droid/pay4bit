@@ -977,12 +977,17 @@ let fsFails = 0;
 setInterval(() => {
   fsPing().then(ms => { if (fsFails) console.log('[keepwarm] Firestore bərpa olundu,', ms, 'ms'); fsFails = 0; })
     .catch(e => {
+      const msg = String(e && e.message || e);
+      if (/RESOURCE_EXHAUSTED|Quota/i.test(msg)) {      // kvota dolub: yenidən başlatmaq kömək etmir
+        console.error('[QUOTA] Firestore gündəlik limiti dolub. Firebase-də Blaze planına keçin və ya limitin sıfırlanmasını gözləyin.');
+        return;
+      }
       fsFails++;
-      console.warn('[keepwarm] Firestore cavab vermədi #' + fsFails, e.message);
+      console.warn('[keepwarm] Firestore cavab vermədi #' + fsFails, msg);
       // Bağlantı "ilişib" qalıbsa ardıcıl 3 uğursuzluqdan sonra proses yenidən başladılır (Render avtomatik qaldırır)
       if (fsFails >= 3) { console.error('[watchdog] Firestore 3 dəfə cavab vermədi — proses yenidən başladılır'); setTimeout(() => process.exit(1), 500); }
     });
-}, 2 * 60 * 1000);
+}, 5 * 60 * 1000);
 
 // Render pulsuz planda yatmasın deyə hər 4 dəqiqədən bir özünü çağırır (kənar cron ilə birlikdə)
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || '';
