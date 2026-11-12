@@ -12,6 +12,8 @@
  *                  Uğurlu ödənişlər 'payments' kolleksiyasında qalır -> admin paneldə 'Pay4bit Depozitlər' bölməsi.
  * Secret key YALNIZ bu serverdə qalır, brauzerə heç vaxt getmir.
  */
+// Render-də IPv6 çıxışı yoxdur; Firestore (gRPC) IPv6 ünvanı əvvəl yoxlayıb uzun müddət asılı qala bilir -> IPv4 əvvəl
+try { require('dns').setDefaultResultOrder('ipv4first'); } catch (_) {}
 const express = require('express');
 const crypto = require('crypto');
 const cors = require('cors');
@@ -136,16 +138,19 @@ app.use(express.json({ limit: '20kb' }));
 app.use(express.urlencoded({ extended: true, limit: '20kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ---- Sorğu taymauti: heç bir sorğu sonsuz asılı qalmasın (brauzer 60 san gözləməsin) ----
+// ---- Sorğu taymauti: heç bir sorğu sonsuz asılı qalmasın; hansı mərhələdə asıldığı loga yazılır ----
 app.use((req, res, next) => {
   if (req.path === '/pay4bit/callback' || req.path === '/betatransfer/callback') return next();
+  const t0 = Date.now();
+  req._stage = 'start';
   const t = setTimeout(() => {
     if (!res.headersSent) {
-      console.error('[timeout] cavab 45 saniyədə hazır olmadı:', req.method, req.path);
+      console.error(`[timeout] 30 saniyədə cavab hazır olmadı: ${req.method} ${req.path} mərhələ=${req._stage}`);
       res.status(503).json({ success: false, error: 'Server məşğuldur, bir az sonra yenidən cəhd edin' });
     }
-  }, 45000);
-  res.on('finish', () => clearTimeout(t));
+  }, 30000);
+  const done = () => { clearTimeout(t); const ms = Date.now() - t0; if (ms > 5000) console.warn(`[slow] ${req.method} ${req.path} ${ms}ms mərhələ=${req._stage}`); };
+  res.on('finish', done);
   res.on('close', () => clearTimeout(t));
   next();
 });
@@ -221,7 +226,13 @@ async function authUser(req, res, next) {
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : null;
     if (!token) return res.status(401).json({ success: false, error: 'Giriş tələb olunur' });
-    req.user = await admin.auth().verifyIdToken(token);
+    req._stage = 'auth';
+    try { req.user = await withTimeout(admin.auth().verifyIdToken(token), 15000); }
+    catch (e) {
+      if (/^timeout/.test(String(e && e.message))) { console.error('[auth] verifyIdToken 15 saniyədə cavab vermədi'); return res.status(503).json({ success: false, error: 'Server məşğuldur, bir az sonra yenidən cəhd edin' }); }
+      throw e;
+    }
+    req._stage = 'handler';
     next();
   } catch (e) { res.status(401).json({ success: false, error: 'Etibarsız token' }); }
 }
@@ -962,7 +973,16 @@ server.headersTimeout = 125 * 1000;
 // ---- Firestore / Auth "isti" saxlanılır (soyuq start və boş qalmış gRPC bağlantısı ilk sorğunu 30-60 san asırdı) ----
 fsPing().then(ms => console.log('[warmup] Firestore hazırdır,', ms, 'ms')).catch(e => console.warn('[warmup] Firestore:', e.message));
 withTimeout(admin.auth().getUserByEmail('warmup@yevroloto.app'), 25000).catch(() => {});
-setInterval(() => { fsPing().catch(e => console.warn('[keepwarm] Firestore:', e.message)); }, 4 * 60 * 1000);
+let fsFails = 0;
+setInterval(() => {
+  fsPing().then(ms => { if (fsFails) console.log('[keepwarm] Firestore bərpa olundu,', ms, 'ms'); fsFails = 0; })
+    .catch(e => {
+      fsFails++;
+      console.warn('[keepwarm] Firestore cavab vermədi #' + fsFails, e.message);
+      // Bağlantı "ilişib" qalıbsa ardıcıl 3 uğursuzluqdan sonra proses yenidən başladılır (Render avtomatik qaldırır)
+      if (fsFails >= 3) { console.error('[watchdog] Firestore 3 dəfə cavab vermədi — proses yenidən başladılır'); setTimeout(() => process.exit(1), 500); }
+    });
+}, 2 * 60 * 1000);
 
 // Render pulsuz planda yatmasın deyə hər 4 dəqiqədən bir özünü çağırır (kənar cron ilə birlikdə)
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || '';
