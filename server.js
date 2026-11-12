@@ -46,6 +46,8 @@ const PAY_SYSTEM = {
 };
 // Minimum məbləğlər (AZN)
 const MIN_AZN = { card: 3, google: 20, apple: 20 };
+// AvtoDepozit (depozit) minimumu 10 AZN; kod alışında kartla minimum 3 AZN olduğu kimi qalır
+const MIN_DEPOSIT_CARD_AZN = Number(process.env.PAY4BIT_MIN_DEPOSIT_CARD || 10);
 
 /**
  * Pay4bit ödəniş səhifəsində müştərinin ödəyəcəyi ümumi məbləğ:
@@ -90,6 +92,24 @@ admin.initializeApp({ credential: admin.credential.cert(SA) });
 const db = admin.firestore();
 try { db.settings({ ignoreUndefinedProperties: true }); } catch (_) {}
 const FieldValue = admin.firestore.FieldValue;
+
+// ---- 2-ci Firebase layihəsi (yevrolato2): yalnız ictimai kampaniya "səbət" siyahısı üçün (oxuma yükünü bölür) ----
+let db2 = null;
+try {
+  const raw2 = process.env.FIREBASE_SERVICE_ACCOUNT_2_B64
+    ? Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_2_B64, 'base64').toString('utf8')
+    : process.env.FIREBASE_SERVICE_ACCOUNT_2;
+  if (raw2 && raw2.trim()) {
+    const SA2 = JSON.parse(raw2.trim());
+    SA2.private_key = String(SA2.private_key || '').replace(/\\n/g, '\n');
+    const app2 = admin.initializeApp({ credential: admin.credential.cert(SA2) }, 'p2');
+    db2 = app2.firestore();
+    try { db2.settings({ ignoreUndefinedProperties: true }); } catch (_) {}
+    console.log('[p2] 2-ci Firebase layihəsi qoşuldu:', SA2.project_id);
+  } else {
+    console.log('[p2] FIREBASE_SERVICE_ACCOUNT_2 verilməyib — səbət siyahısı 1-ci layihədən oxunacaq.');
+  }
+} catch (e) { console.error('[p2] 2-ci layihə qoşulmadı:', e.message); db2 = null; }
 
 const app = express();
 app.disable('x-powered-by');
@@ -282,7 +302,8 @@ app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 1
     const raw = String(req.body.amount ?? '').trim().replace(',', '.');
     if (!/^\d+(\.\d{1,2})?$/.test(raw)) return res.status(400).json({ success: false, error: 'Məbləğ yanlışdır' });
     const azn = Number(raw);
-    if (azn < MIN_AZN[method]) return res.status(400).json({ success: false, error: `Minimum ${MIN_AZN[method]} AZN` });
+    const minNeeded = (purpose === 'deposit' && method === 'card') ? MIN_DEPOSIT_CARD_AZN : MIN_AZN[method];
+    if (azn < minNeeded) return res.status(400).json({ success: false, error: `Minimum ${minNeeded} AZN` });
     if (azn > MAX_AZN) return res.status(400).json({ success: false, error: `Maksimum ${MAX_AZN} AZN` });
 
     const { aznPerEur, source } = await getAznPerEur();
@@ -463,7 +484,9 @@ async function pay4bitCallback(req, res) {
 
         // ---- yazmalar ----
         const platform = order.platform || 'fastloto';
-        const bonus = (u.firstDepositBonus === 'pending') ? round2(order.aznAmount) : 0;   // PayÇarx: ilk depozit 2x
+        // Hər uğurlu DEPOZİT = 2 qat balans (depozit + bonus). Köhnə PayÇarx "ilk depozit 2x" qaydası üst-üstə gəlmir (3x olmur).
+        const wheelPending = (u.firstDepositBonus === 'pending');
+        const bonus = (purpose === 'deposit' || wheelPending) ? round2(order.aznAmount) : 0;
         const payUpdate = {
           status: 'paid', purpose, bonus, userName: u.displayName || order.userName || '',
           userUniqueId: u.uniqueId || order.userUniqueId || '',
@@ -478,7 +501,7 @@ async function pay4bitCallback(req, res) {
         if (purpose === 'deposit') userUpd.payWheelSpins = FieldValue.increment(1);
         let balanceAdd = 0;
         if (purpose === 'deposit') balanceAdd += order.aznAmount;
-        if (bonus > 0) { balanceAdd += bonus; userUpd.firstDepositBonus = 'used'; }
+        if (bonus > 0) { balanceAdd += bonus; if (wheelPending) userUpd.firstDepositBonus = 'used'; }
         if (balanceAdd > 0) userUpd.balance = FieldValue.increment(round2(balanceAdd));
         if (purpose === 'deposit') userUpd.hasDeposited = true;   // PayÇarx: depozit edənlər köhnə qaydada fırlayır
         tx.update(userRef, userUpd);
@@ -499,7 +522,7 @@ async function pay4bitCallback(req, res) {
         if (bonus > 0) {
           tx.set(userRef.collection('history').doc('bonus_' + account), {
             type: 'bonus', amount: bonus,
-            description: 'PayÇarx bonus: ilk depozitin 2 qatı', createdAt: FieldValue.serverTimestamp()
+            description: wheelPending ? 'PayÇarx bonus: ilk depozitin 2 qatı' : 'Depozit bonusu: 2 qat balans', createdAt: FieldValue.serverTimestamp()
           });
         }
 
@@ -952,7 +975,7 @@ async function fsPing() {
 }
 // Dərin yoxlama (cron üçün YOX, diaqnostika üçün): Firestore cavab verirmi?
 app.get(['/health/deep', '/api/health/deep'], async (req, res) => {
-  try { res.json({ ok: true, firestoreMs: await fsPing() }); }
+  try { res.json({ ok: true, firestoreMs: await fsPing(), p2: !!db2 }); }
   catch (e) { res.status(503).json({ ok: false, error: String(e && e.message || e) }); }
 });
 
@@ -963,6 +986,48 @@ app.use((req, res) => res.status(404).json({ success: false, error: 'Tapılmadı
 app.use((err, req, res, next) => { console.error('[express]', err); res.status(500).json({ success: false, error: 'Server xətası' }); });
 process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
 process.on('uncaughtException', e => console.error('[uncaughtException]', e));
+
+// ---------- Kampaniya səbəti: campaignCodes -> 2-ci layihədə TƏK sənəd (public/campaignBasket) ----------
+// Brauzerlər 1000 sənəd əvəzinə 2-ci layihədən 1 sənəd oxuyur. 1-ci layihədən yalnız YENİ kodlar oxunur.
+const BASKET_MAX = 1000;
+let basketBusy = false, basketLastErr = '';
+async function syncCampaignBasket() {
+  if (!db2 || basketBusy) return;
+  basketBusy = true;
+  try {
+    const ref2 = db2.collection('public').doc('campaignBasket');
+    const snap2 = await withTimeout(ref2.get(), 30000);
+    const prev = snap2.exists ? (snap2.data() || {}) : {};
+    const lastMs = Number(prev.syncedMs) || 0;
+    let q = db.collection('campaignCodes');
+    q = lastMs
+      ? q.where('createdAt', '>=', admin.firestore.Timestamp.fromMillis(Math.max(0, lastMs - 120000))).orderBy('createdAt', 'desc').limit(BASKET_MAX)
+      : q.orderBy('createdAt', 'desc').limit(BASKET_MAX);
+    const res = await withTimeout(q.get(), 30000);
+    const map = new Map((Array.isArray(prev.items) ? prev.items : []).map(x => [x.code, x]));
+    let changed = !snap2.exists, maxMs = lastMs;
+    for (const d of res.docs) {
+      const x = d.data() || {};
+      if (!x.code) continue;
+      const ms = x.createdAt && x.createdAt.toMillis ? x.createdAt.toMillis() : 0;
+      const item = { code: String(x.code), uniqueId: String(x.uniqueId || ''), source: String(x.source || ''), s: Math.floor(ms / 1000) };
+      const old = map.get(item.code);
+      if (!old || old.uniqueId !== item.uniqueId || old.s !== item.s) changed = true;
+      map.set(item.code, item);
+      if (ms > maxMs) maxMs = ms;
+    }
+    basketLastErr = '';
+    if (!changed) return;
+    const items = [...map.values()].sort((a, b) => (b.s || 0) - (a.s || 0)).slice(0, BASKET_MAX);
+    await withTimeout(ref2.set({ items, count: items.length, syncedMs: maxMs || Date.now(), updatedAt: FieldValue.serverTimestamp() }), 30000);
+    console.log('[basket] yeniləndi:', items.length, 'kod');
+  } catch (e) {
+    const m = String(e && e.message || e);
+    if (m !== basketLastErr) console.warn('[basket] sinxron xətası:', m);
+    basketLastErr = m;
+  } finally { basketBusy = false; }
+}
+if (db2) { setTimeout(syncCampaignBasket, 20000); setInterval(syncCampaignBasket, 5 * 60 * 1000); }
 
 const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, '0.0.0.0', () => console.log(`Server ${PORT} portunda işləyir`));

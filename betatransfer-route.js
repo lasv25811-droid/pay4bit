@@ -12,7 +12,7 @@
  *   BETATRANSFER_PAYMENT_SYSTEM          Azərbaycan kart-to-kart üçün paymentSystem kodu
  *                                        (GET /api/payment-system və ya BetaTransfer menecerindən)
  *   BETATRANSFER_CURRENCY                default AZN
- *   BETATRANSFER_MIN / BETATRANSFER_MAX  default 5 / 2000 (AZN)
+ *   BETATRANSFER_MIN / BETATRANSFER_MAX  default 7 / 2000 (AZN)
  *   BETATRANSFER_SIGN_FIELDS             yaratma imzasının sahə sırası (vergüllə), default aşağıdadır.
  *                                        Sənəddə sıra yazılmayıb -> 403/invalid signature olsa BU dəyişənlə düzəldilir.
  *   BETATRANSFER_CALLBACK_BASE           məs. https://pay4bit.onrender.com (default RENDER_EXTERNAL_URL)
@@ -51,7 +51,7 @@ module.exports = function registerBetaTransferRoutes(app, deps) {
 
   const PAYMENT_SYSTEM = String(process.env.BETATRANSFER_PAYMENT_SYSTEM || '').trim();
   const CURRENCY = String(process.env.BETATRANSFER_CURRENCY || 'AZN').trim().toUpperCase();
-  const MIN_AZN = Number(process.env.BETATRANSFER_MIN || 5);
+  const MIN_AZN = Number(process.env.BETATRANSFER_MIN || 7);
   const MAX_AZN = Number(process.env.BETATRANSFER_MAX || 2000);
   const SIGN_FIELDS = String(process.env.BETATRANSFER_SIGN_FIELDS ||
     'amount,currency,orderId,paymentSystem,urlResult,urlSuccess,urlFail,payerId')
