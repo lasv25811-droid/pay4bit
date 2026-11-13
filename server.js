@@ -1,18 +1,6 @@
 /**
- * YevroLato – Pay4bit backend (FASTLOTO KOD AL)
- * Axın:
- *  1) Frontend  -> POST /create-payment  (Firebase ID token + AZN kod məbləği + üsul)
- *  2) Server    -> aktiv məzənnə (CBAR) ilə AZN -> EUR çevirir, Pay4bit komissiyasını məbləğin İÇİNDƏ saxlayır
- *                  (müştəri komissiya daxil ÜMUMİ olaraq yazdığı AZN-in avro qarşılığını ödəyir), imzalı Pay4bit linki qaytarır
- *  3) İstifadəçi Pay4bit-də ödəyir (kart / Google Pay / Apple Pay)
- *  4) Pay4bit   -> /pay4bit/callback (CHECK -> PAY) ; server imzanı + məbləği yoxlayır,
- *                  purpose='deposit' -> sayt balansı AVTOMATİK artırılır (+ xal, + PayÇarx fırlatması, ilk depozit 2x bonusu)
- *                  purpose='code'    -> admin panelindəki kod hovuzundan (fastlotoCodes) həmin məbləğdə kod verilir
- *                                       (hovuzda yoxdursa adminə kod tələbi yaradılır). Balans artırılmır.
- *                  Uğurlu ödənişlər 'payments' kolleksiyasında qalır -> admin paneldə 'Pay4bit Depozitlər' bölməsi.
- * Secret key YALNIZ bu serverdə qalır, brauzerə heç vaxt getmir.
+ * YevroLato – Pay4bit backend
  */
-// Render-də IPv6 çıxışı yoxdur; Firestore (gRPC) IPv6 ünvanı əvvəl yoxlayıb uzun müddət asılı qala bilir -> IPv4 əvvəl
 try { require('dns').setDefaultResultOrder('ipv4first'); } catch (_) {}
 const express = require('express');
 const crypto = require('crypto');
@@ -20,8 +8,6 @@ const cors = require('cors');
 const path = require('path');
 const admin = require('firebase-admin');
 
-// ---------- Konfiqurasiya ----------
-// Açarlar YALNIZ mühit dəyişənlərindən oxunur (kodda saxlanmır).
 const PUBLIC_KEY = process.env.PAY4BIT_PUBLIC_KEY || '';
 const SECRET_KEY = process.env.PAY4BIT_SECRET_KEY || '';
 if (!PUBLIC_KEY || !SECRET_KEY) {
@@ -29,14 +15,10 @@ if (!PUBLIC_KEY || !SECRET_KEY) {
   process.exit(1);
 }
 
-// Firebase service account (null qalsa mühit dəyişənindən oxunur)
 const FIREBASE_SA = null;
-// =======================================
 const PAY4BIT_URL = 'https://api.pay4bit.net/pay';
 const CHARGE_CURRENCY = 'EUR';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-// PAY callback-də yalnız md5 `sign` (localpayId + secret) qəbul olunur. check_sign istifadəçiyə ödəniş linkində göründüyü üçün
-// onunla PAY qəbul etmək saxta ödənişə yol açır. Pay4bit yalnız check_sign göndərirsə (nadir) 'false' yazın — amma bu TƏHLÜKƏLİDİR.
 const PAY_REQUIRE_SIGN = String(process.env.PAY4BIT_PAY_REQUIRE_SIGN || 'true').trim().toLowerCase() !== 'false';
 
 const PAY_SYSTEM = {
@@ -44,20 +26,9 @@ const PAY_SYSTEM = {
   google: process.env.PAY4BIT_GOOGLE_PS || '',
   apple:  process.env.PAY4BIT_APPLE_PS  || ''
 };
-// Minimum məbləğlər (AZN)
 const MIN_AZN = { card: 3, google: 20, apple: 20 };
-// AvtoDepozit (depozit) minimumu 10 AZN; kod alışında kartla minimum 3 AZN olduğu kimi qalır
 const MIN_DEPOSIT_CARD_AZN = Number(process.env.PAY4BIT_MIN_DEPOSIT_CARD || 10);
 
-/**
- * Pay4bit ödəniş səhifəsində müştərinin ödəyəcəyi ümumi məbləğ:
- *     ümumi = göndərilən * (1 + faiz/100) + sabit
- * Ölçmə (Google Pay): göndərilən 7.32 € -> 11.17 €, göndərilən 14.65 € -> 19.83 €
- *     => faiz ≈ 18.14 %, sabit ≈ 2.52 €
- * Server tərsini hesablayır: göndərilən = (hədəf - sabit) / (1 + faiz/100)
- * Beləliklə səhifədə həmişə yazılan AZN-in avro qarşılığı görünür.
- * Kart üçün komissiya ölçülməyib -> 0 (ölçəndən sonra Render env ilə yaz).
- */
 const COMMISSION_PERCENT = {
   card:   Number(process.env.PAY4BIT_COMM_CARD   || 0),
   google: Number(process.env.PAY4BIT_COMM_GOOGLE || 18.14),
@@ -69,7 +40,7 @@ const COMMISSION_FIXED_EUR = {
   apple:  Number(process.env.PAY4BIT_FIX_APPLE  || 2.52)
 };
 const MAX_AZN = 2000;
-const MIN_CHARGE = 1; // Pay4bit minimumu 1 EUR
+const MIN_CHARGE = 1;
 
 let SA = null;
 try {
@@ -82,18 +53,17 @@ try {
 }
 if (!SA) SA = FIREBASE_SA;
 if (!SA || !SA.private_key || !SA.client_email) {
-  console.error('Firebase service account tapılmadı və ya natamamdır (private_key / client_email yoxdur).');
+  console.error('Firebase service account tapılmadı və ya natamamdır.');
   process.exit(1);
 }
 SA.private_key = String(SA.private_key).replace(/\\n/g, '\n');
-console.log('Firebase service account yükləndi.');
 
 admin.initializeApp({ credential: admin.credential.cert(SA) });
 const db = admin.firestore();
 try { db.settings({ ignoreUndefinedProperties: true }); } catch (_) {}
 const FieldValue = admin.firestore.FieldValue;
 
-// ---- 2-ci Firebase layihəsi (yevrolato2): yalnız ictimai kampaniya "səbət" siyahısı üçün (oxuma yükünü bölür) ----
+// 2-ci Firebase layihəsi (yevrolato2)
 let db2 = null;
 try {
   const raw2 = process.env.FIREBASE_SERVICE_ACCOUNT_2_B64
@@ -107,15 +77,14 @@ try {
     try { db2.settings({ ignoreUndefinedProperties: true }); } catch (_) {}
     console.log('[p2] 2-ci Firebase layihəsi qoşuldu:', SA2.project_id);
   } else {
-    console.log('[p2] FIREBASE_SERVICE_ACCOUNT_2 verilməyib — səbət siyahısı 1-ci layihədən oxunacaq.');
+    console.log('[p2] FIREBASE_SERVICE_ACCOUNT_2 verilməyib.');
   }
-} catch (e) { console.error('[p2] 2-ci layihə qoşulmadı:', e.message); db2 = null; }
+} catch (e) { console.error('[p2] qoşulmadı:', e.message); db2 = null; }
 
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
-// ---- Real istifadəçi IP-si (Render/Cloudflare arxasında req.ip hamı üçün eyni proksi IP-si ola bilər) ----
 function getClientIp(req) {
   const h = req.headers || {};
   const pick = v => String(Array.isArray(v) ? v[0] : (v || '')).split(',')[0].trim();
@@ -124,7 +93,6 @@ function getClientIp(req) {
 }
 app.use((req, res, next) => { req.realIp = getClientIp(req); next(); });
 
-// ---- Təhlükəsizlik başlıqları ----
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -134,13 +102,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- CORS (limitdən ƏVVƏL: 429/xəta cavabları da brauzerə çatsın, "server ilə əlaqə yoxdur" görünməsin) ----
-// Bütün sorğular Authorization: Bearer token ilə gedir (cookie YOXDUR) -> CORS-u məhdudlaşdırmaq təhlükəsizlik vermir,
-// amma yanlış ALLOWED_ORIGINS brauzerdə "server cavab vermir" xətasına çevrilirdi. Ona görə origin həmişə qəbul olunur.
 app.use(cors({ origin: true, methods: ['GET', 'POST', 'OPTIONS'], maxAge: 86400 }));
 
-
-// ---- Ümumi sorğu limiti (hər real IP üçün dəqiqədə; callback, health və OPTIONS istisna) ----
 const GLOBAL_LIMIT = Math.max(60, Number(process.env.RATE_LIMIT_PER_MIN) || 600);
 const globalHits = new Map();
 setInterval(() => { const now = Date.now(); for (const [k, v] of globalHits) if (now - v.t > 60000) globalHits.delete(k); }, 60000).unref();
@@ -158,7 +121,6 @@ app.use(express.json({ limit: '20kb' }));
 app.use(express.urlencoded({ extended: true, limit: '20kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ---- Sorğu taymauti: heç bir sorğu sonsuz asılı qalmasın; hansı mərhələdə asıldığı loga yazılır ----
 app.use((req, res, next) => {
   if (req.path === '/pay4bit/callback' || req.path === '/betatransfer/callback') return next();
   const t0 = Date.now();
@@ -175,7 +137,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- Aktiv məzənnə (AZN -> EUR) ----------
 let rateCache = { aznPerEur: null, at: 0, source: null };
 const RATE_TTL = 30 * 60 * 1000;
 
@@ -213,17 +174,12 @@ async function getAznPerEur() {
     try { rateCache = { aznPerEur: await fetchBackupEur(), at: Date.now(), source: 'er-api' }; }
     catch (e2) {
       if (rateCache.aznPerEur) return rateCache;
-      // Hər iki mənbə işləməsə də ödəniş dayanmasın: ehtiyat sabit kurs
       rateCache = { aznPerEur: Number(process.env.FALLBACK_AZN_PER_EUR || 1.98), at: Date.now() - RATE_TTL + 60000, source: 'fallback' };
-      console.warn('[rate] CBAR və ehtiyat mənbə işləmədi, sabit kurs:', rateCache.aznPerEur);
     }
   }
   return rateCache;
 }
 
-// azn = müştərinin ödəməli olduğu ümumi məbləğ (AZN). Hədəf avro = azn / kurs.
-// Pay4bit göndərilənin üstünə faiz + sabit əlavə etdiyi üçün göndərilən məbləğ tərsinə hesablanır.
-// Ən yaxın sentə yuvarlaqlanır ki, səhifədə görünən məbləğ hədəfə maksimum yaxın olsun.
 function aznToEur(azn, aznPerEur, commissionPercent, fixedEur) {
   const target = azn / aznPerEur;
   const send = (target - (fixedEur || 0)) / (1 + (commissionPercent || 0) / 100);
@@ -233,7 +189,6 @@ function payerTotal(sendEur, commissionPercent, fixedEur) {
   return (Number(sendEur) * (1 + (commissionPercent || 0) / 100) + (fixedEur || 0)).toFixed(2);
 }
 
-// ---------- Köməkçilər ----------
 const sha256 = s => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 const md5 = s => crypto.createHash('md5').update(s, 'utf8').digest('hex');
 function safeEq(a, b) {
@@ -249,7 +204,7 @@ async function authUser(req, res, next) {
     req._stage = 'auth';
     try { req.user = await withTimeout(admin.auth().verifyIdToken(token), 15000); }
     catch (e) {
-      if (/^timeout/.test(String(e && e.message))) { console.error('[auth] verifyIdToken 15 saniyədə cavab vermədi'); return res.status(503).json({ success: false, error: 'Server məşğuldur, bir az sonra yenidən cəhd edin' }); }
+      if (/^timeout/.test(String(e && e.message))) { return res.status(503).json({ success: false, error: 'Server məşğuldur, bir az sonra yenidən cəhd edin' }); }
       throw e;
     }
     req._stage = 'handler';
@@ -257,7 +212,6 @@ async function authUser(req, res, next) {
   } catch (e) { res.status(401).json({ success: false, error: 'Etibarsız token' }); }
 }
 
-// ---- İstifadəçi başına limit (Firestore-a spam sorğuların qarşısı) ----
 const uidHits = new Map();
 setInterval(() => { const now = Date.now(); for (const [k, v] of uidHits) if (now - v.t > 120000) uidHits.delete(k); }, 60000).unref();
 function uidLimit(tag, max, windowMs) {
@@ -271,7 +225,6 @@ function uidLimit(tag, max, windowMs) {
     next();
   };
 }
-// ---- Callback üçün IP limiti (imza yoxlamasından əvvəl, boş sorğularla yükləməyə qarşı) ----
 const cbHits = new Map();
 setInterval(() => { const now = Date.now(); for (const [k, v] of cbHits) if (now - v.t > 60000) cbHits.delete(k); }, 60000).unref();
 function callbackLimit(req, res, next) {
@@ -283,7 +236,6 @@ function callbackLimit(req, res, next) {
   next();
 }
 
-// ---------- Məzənnə (frontend önbaxışı üçün) ----------
 app.get(['/rate', '/api/rate'], async (req, res) => {
   try {
     const r = await getAznPerEur();
@@ -291,7 +243,6 @@ app.get(['/rate', '/api/rate'], async (req, res) => {
   } catch (e) { res.status(503).json({ success: false, error: e.message }); }
 });
 
-// ---------- Ödəniş yarat ----------
 app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 10, 60000), async (req, res) => {
   try {
     const method = String(req.body.method || '');
@@ -311,7 +262,7 @@ app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 1
     const fixedFee = COMMISSION_FIXED_EUR[method] || 0;
     const amount = aznToEur(azn, aznPerEur, commission, fixedFee);
     const payerTotalEur = payerTotal(amount, commission, fixedFee);
-    console.log(`[create-payment] ${method} ${azn} AZN | kurs ${aznPerEur} | komissiya ${commission}%+${fixedFee} EUR | Pay4bit-ə gedən ${amount} EUR | səhifədə görünəcək ≈ ${payerTotalEur} EUR (hədəf ${(azn / aznPerEur).toFixed(2)} EUR)`);
+    console.log(`[create-payment] ${method} ${azn} AZN | kurs ${aznPerEur} | ${amount} EUR | səhifədə ≈ ${payerTotalEur} EUR`);
     if (Number(amount) < MIN_CHARGE) {
       return res.status(400).json({ success: false, error: 'Məbləğ Pay4bit minimumundan (1 EUR) azdır' });
     }
@@ -319,7 +270,7 @@ app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 1
     const orderId = Date.now().toString(36) + crypto.randomBytes(4).toString('hex');
     const account = orderId;
     const desc = purpose === 'deposit' ? `YevroLato depozit ${orderId}` : `YevroLato FASTLOTO kod ${orderId}`;
-    const sign = sha256(desc + account + amount + SECRET_KEY);   // check_sign
+    const sign = sha256(desc + account + amount + SECRET_KEY);
 
     let uName = '', uUnique = '';
     try {
@@ -349,7 +300,6 @@ app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 1
   }
 });
 
-// ---------- Ödəniş statusu (istifadəçi geri qayıdanda) ----------
 app.get(['/payment-status', '/api/payment-status'], authUser, async (req, res) => {
   try {
     const snap = await db.collection('payments').doc(String(req.query.order || '')).get();
@@ -358,7 +308,7 @@ app.get(['/payment-status', '/api/payment-status'], authUser, async (req, res) =
     res.json({
       success: true, status: d.status, azn: d.aznAmount,
       purpose: d.purpose || 'code', bonus: d.bonus || 0,
-      codeStatus: d.codeStatus || null,            // 'delivered' | 'admin_pending'
+      codeStatus: d.codeStatus || null,
       code: d.codeStatus === 'delivered' ? d.code : null,
       codeRequestId: d.codeRequestId || null
     });
@@ -368,13 +318,9 @@ app.get(['/payment-status', '/api/payment-status'], authUser, async (req, res) =
   }
 });
 
-// ---------- 2027 Yeni İl Kampaniyası (YeKod) ----------
-// Hər uğurlu Pay4bit DEPOZİTİNDƏ avtomatik YeKod verilir (çıxarışda isə admin təsdiq edəndə — admin.html).
-// Kod nə qədər çox olarsa, qazanma şansı o qədər çox olur.
-// campaignCodes/{kod} -> açıq səbət (yalnız ID + kod + mənbə; ad/uid YOXDUR)
-const CAMPAIGN_END = new Date(process.env.CAMPAIGN_END_ISO || '2026-12-31T20:00:00Z'); // 1 yanvar 2027 00:00 (Bakı)
+const CAMPAIGN_END = new Date(process.env.CAMPAIGN_END_ISO || '2026-12-31T20:00:00Z');
 const CAMPAIGN_START = process.env.CAMPAIGN_START_ISO ? new Date(process.env.CAMPAIGN_START_ISO) : null;
-const YE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 0/O, 1/I qarışmasın
+const YE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 function genYeKod() {
   const b = crypto.randomBytes(8);
   let c = '';
@@ -386,14 +332,13 @@ function campaignActive() {
   return now < CAMPAIGN_END && (!CAMPAIGN_START || now >= CAMPAIGN_START);
 }
 
-// ---------- Pay4bit callback (CHECK / PAY / ERROR) ----------
 async function pay4bitCallback(req, res) {
   const reply = (message, code = 200) => res.status(code).json({ result: { message } });
   try {
     const q = { ...(req.query || {}), ...(req.body || {}) };
     let p = q.params;
     if (typeof p === 'string') { try { p = JSON.parse(p); } catch (_) { p = null; } }
-    if (!p || typeof p !== 'object') {            // params[account] kimi düz açarlar və ya params yoxdur
+    if (!p || typeof p !== 'object') {
       p = {};
       for (const k of Object.keys(q)) { const m = k.match(/^params\[(.+)\]$/); if (m) p[m[1]] = q[k]; }
       if (!Object.keys(p).length) p = q;
@@ -404,7 +349,6 @@ async function pay4bitCallback(req, res) {
     const desc = str(p.desc);
     const uniq = arr => [...new Set(arr.filter(x => x !== ''))];
 
-    // Pay4bit hansı sahədə məbləği imzalayıbsa (sum / amount / orderSum / payerSum) onu tapırıq
     let signedSum = null, signedAmt = null;
     if (p.sign && p.localpayId) {
       for (const sv of uniq([str(p.sum), str(p.amount), str(p.orderSum), str(p.payerSum)])) {
@@ -417,28 +361,23 @@ async function pay4bitCallback(req, res) {
       }
     }
     const okSign = signedSum !== null, okCheck = signedAmt !== null;
-    console.log(`[callback] method=${method} account=${account} sign=${okSign} check_sign=${okCheck} keys=${Object.keys(p).join(',')}`);
 
-    if (!okCheck && !okSign) { console.warn('[callback] imza səhvdir', account); return reply('Invalid signature', 400); }
+    if (!okCheck && !okSign) { return reply('Invalid signature', 400); }
 
     const ref = db.collection('payments').doc(account);
     const snap = await ref.get();
     if (!snap.exists) return reply('Order not found', 404);
     const order = snap.data();
 
-    // PAY yalnız md5 `sign` ilə təsdiqlənir (check_sign istifadəçiyə məlumdur -> saxtalaşdırıla bilər)
     if (method === 'pay' && PAY_REQUIRE_SIGN && !okSign) {
-      console.warn('[callback] PAY rədd edildi: md5 sign yoxdur/yanlışdır, yalnız check_sign gəldi', account);
       await ref.update({ cbIssue: 'pay_needs_md5_sign', cbIssueAt: FieldValue.serverTimestamp() }).catch(() => {});
       return reply('Invalid signature', 400);
     }
 
-    // İmzalanmış məbləğ sifarişdəki məbləğə (Pay4bit-ə göndərilən və ya komissiya daxil ödənilən) uyğun olmalıdır
     const signed = okSign ? signedSum : signedAmt;
     const expected = [order.chargeAmount, order.payerTotalEur].filter(x => x !== undefined && x !== null && x !== '').map(x => Number(x).toFixed(2));
     const curr = String(p.currency || '').toUpperCase();
     if (!expected.includes(Number(signed).toFixed(2)) || (curr && curr !== order.chargeCurrency)) {
-      console.warn('[callback] məbləğ uyğunsuzluğu', account, 'gələn:', signed, curr, 'gözlənilən:', expected.join('/'), order.chargeCurrency);
       await ref.update({ cbIssue: 'amount_mismatch:' + signed + ' ' + curr, cbIssueAt: FieldValue.serverTimestamp() }).catch(() => {});
       return reply('Amount mismatch', 400);
     }
@@ -453,9 +392,8 @@ async function pay4bitCallback(req, res) {
     if (method === 'pay') {
       const round2 = n => Math.round(n * 100) / 100;
       await db.runTransaction(async tx => {
-        // ---- bütün oxumalar əvvəl ----
         const cur = await tx.get(ref);
-        if (cur.data().status === 'paid') return;              // təkrar PAY -> ikinci dəfə balans/kod vermə
+        if (cur.data().status === 'paid') return;
         const purpose = order.purpose === 'deposit' ? 'deposit' : 'code';
         const userRef = db.collection('users').doc(order.uid);
         const userSnap = await tx.get(userRef);
@@ -463,8 +401,7 @@ async function pay4bitCallback(req, res) {
         let poolDoc = null, poolCode = '';
         if (purpose === 'code') {
           const ps = await tx.get(db.collection('fastlotoCodes')
-            .where('amount', '==', order.aznAmount).where('status', '==', 'available').limit(10));
-          // Kodun özü fastlotoSecrets/{id}-də saxlanır (admin paneli belə yazır). Kodu boş/oxunmayan sənədlər keçilir.
+            .where('amount', '==', order.aznAmount).where('status', '==', 'available').limit(30));
           for (const dd of ps.docs) {
             const sd = await tx.get(db.collection('fastlotoSecrets').doc(dd.id));
             const c = String((sd.exists && sd.data().code) || dd.data().code || '').trim();
@@ -472,7 +409,6 @@ async function pay4bitCallback(req, res) {
           }
         }
 
-        // ---- 2027 kampaniya: bu istifadəçinin kodu varmı? yoxdursa boş kod seç ----
         let campaignNew = null;
         if (purpose === 'deposit' && campaignActive()) {
           for (let i = 0; i < 6 && !campaignNew; i++) {
@@ -482,9 +418,7 @@ async function pay4bitCallback(req, res) {
           }
         }
 
-        // ---- yazmalar ----
         const platform = order.platform || 'fastloto';
-        // Hər uğurlu DEPOZİT = 2 qat balans (depozit + bonus). Köhnə PayÇarx "ilk depozit 2x" qaydası üst-üstə gəlmir (3x olmur).
         const wheelPending = (u.firstDepositBonus === 'pending');
         const bonus = (purpose === 'deposit' || wheelPending) ? round2(order.aznAmount) : 0;
         const payUpdate = {
@@ -494,16 +428,13 @@ async function pay4bitCallback(req, res) {
           paymentType: String(p.paymentType || ''), paidAt: FieldValue.serverTimestamp()
         };
 
-        const userUpd = {
-          points: FieldValue.increment(order.aznAmount)        // 1 AZN = 1 xal
-        };
-        // PayÇarx: hər uğurlu DEPOZİT 1 fırlatma açır (kod alışı fırlatma vermir)
+        const userUpd = { points: FieldValue.increment(order.aznAmount) };
         if (purpose === 'deposit') userUpd.payWheelSpins = FieldValue.increment(1);
         let balanceAdd = 0;
         if (purpose === 'deposit') balanceAdd += order.aznAmount;
         if (bonus > 0) { balanceAdd += bonus; if (wheelPending) userUpd.firstDepositBonus = 'used'; }
         if (balanceAdd > 0) userUpd.balance = FieldValue.increment(round2(balanceAdd));
-        if (purpose === 'deposit') userUpd.hasDeposited = true;   // PayÇarx: depozit edənlər köhnə qaydada fırlayır
+        if (purpose === 'deposit') userUpd.hasDeposited = true;
         tx.update(userRef, userUpd);
 
         if (purpose === 'deposit') {
@@ -555,7 +486,6 @@ async function pay4bitCallback(req, res) {
         }
         tx.update(ref, payUpdate);
       });
-      console.log('[callback] PAY uğurlu', account, order.purpose, order.aznAmount, 'AZN');
       return reply('Request successfully processed');
     }
     return reply('Unknown method', 400);
@@ -567,24 +497,17 @@ async function pay4bitCallback(req, res) {
 app.get('/pay4bit/callback', callbackLimit, pay4bitCallback);
 app.post('/pay4bit/callback', callbackLimit, pay4bitCallback);
 
-// ---------- OTP (OTPBAY) — nömrə təsdiqi ----------
-// Açar Render-də OTP_API_KEY mühit dəyişəni ilə də verilə bilər (varsa o üstünlük təşkil edir).
 const OTP_API_KEY = String(process.env.OTP_API_KEY || '').trim().replace(/^["']+|["']+$/g, '');
-// OTP_BASE_URL: https://api.otpbay.com (sonunda /v1 yazılıb-yazılmaması vacib deyil)
 const OTP_BASE = (process.env.OTP_BASE_URL || 'https://api.otpbay.com').trim().replace(/\/+$/, '').replace(/\/v1$/i, '') + '/v1';
-const OTP_LOCALE = process.env.OTP_LOCALE || '';          // məs: 'az' (boşdursa göndərilmir)
-const OTP_COOLDOWN_MS = 60 * 1000;                         // təkrar göndərmə arası
-const OTP_MAX_SENDS_PER_HOUR = 5;                          // bir istifadəçi üçün saatda
-const OTP_MAX_ATTEMPTS = 5;                                // bir kod üçün yanlış cəhd limiti
-// SMS API hələ qoşulmayıb: SMS_SIMULATE=true kod serverdə təsadüfi yaradılır,
-// real SMS göndərilmir. Real API hazır olanda Render-də SMS_SIMULATE=false yazın və OTP_API_KEY əlavə edin.
-// SMS_SIMULATE yalnız Render-də açıq şəkildə "false" yazılsa söndürülür (OTP_API_KEY olsa belə simulyasiya işləyir).
+const OTP_LOCALE = process.env.OTP_LOCALE || '';
+const OTP_COOLDOWN_MS = 60 * 1000;
+const OTP_MAX_SENDS_PER_HOUR = 5;
+const OTP_MAX_ATTEMPTS = 5;
 const SMS_SIMULATE = String(process.env.SMS_SIMULATE || 'true').trim().toLowerCase() !== 'false';
 const SIM_CODE_TTL_MS = 10 * 60 * 1000;
-if (SMS_SIMULATE) console.warn('[təhlükəsizlik] SMS_SIMULATE aktivdir: təsdiq kodu cavabda qaytarılır, nömrə həqiqətən doğrulanmır. Real SMS qoşulanda Render-də SMS_SIMULATE=false yazın.');
 const simHash = (uid, phone, code) => crypto.createHash('sha256').update(`${uid}|${phone}|${code}|yl-sms-sim`).digest('hex');
 const OTP_IP_MAX_PER_HOUR = Math.max(20, Number(process.env.OTP_IP_MAX_PER_HOUR) || 60);
-const otpIpHits = new Map();                               // ip -> [vaxtlar] (SMS pumping qorunması)
+const otpIpHits = new Map();
 
 function normPhoneAz(raw) {
   const s = String(raw || '').trim();
@@ -594,7 +517,7 @@ function normPhoneAz(raw) {
   if (!d) return null;
   if (!plus) {
     if (d.startsWith('00')) d = d.slice(2);
-    else if (d.startsWith('994')) { /* artıq ölkə kodu ilə */ }
+    else if (d.startsWith('994')) { }
     else if (d.length === 10 && d.startsWith('0')) d = '994' + d.slice(1);
     else if (d.length === 9) d = '994' + d;
     else return null;
@@ -619,10 +542,6 @@ async function otpApi(method, path, body) {
   }
 }
 function otpFail(res, r) {
-  const d = r.data || {};
-  const e = (d.error && typeof d.error === 'object') ? d.error : {};
-  const detail = [e.type || e.code, e.message || (typeof d.error === 'string' ? d.error : '') || d.message].filter(Boolean).join(': ').slice(0, 200);
-  console.warn('[otp] xəta', r.status, detail);
   const map = {
     0:   [502, 'SMS xidməti ilə əlaqə qurulmadı, bir az sonra yenidən cəhd edin'],
     401: [502, 'SMS xidməti müvəqqəti əlçatmazdır'],
@@ -637,7 +556,6 @@ function otpFail(res, r) {
   const m = map[r.status] || [502, 'SMS xidməti müvəqqəti əlçatmazdır'];
   return res.status(m[0]).json({ success: false, error: m[1] });
 }
-const cleanIp = ip => String(ip || '').replace(/^::ffff:/i, '');
 function otpIpAllowed(ip) {
   const now = Date.now();
   const arr = (otpIpHits.get(ip) || []).filter(t => now - t < 3600000);
@@ -647,7 +565,6 @@ function otpIpAllowed(ip) {
 }
 const otpPick = (d, ...keys) => { for (const k of keys) if (d && d[k] !== undefined && d[k] !== null) return d[k]; return undefined; };
 
-// Doğrulama uğurlu olanda: phoneVerified=true + (ilk dəfə) 1 PayÇarx
 async function otpFinalize(uid, phone) {
   const ref = db.collection('users').doc(uid);
   let out = { bonus: 0, spinBonus: 0, spins: 0, points: 0 };
@@ -660,7 +577,7 @@ async function otpFinalize(uid, phone) {
       spins += 1;
       upd.payWheelSpins = spins;
       upd.phoneSpinGiven = true;
-      upd.welcomeSpinGiven = true;   // qeydiyyat hədiyyəsi ilə ikiqat PayÇarx verilməsin
+      upd.welcomeSpinGiven = true;
       out.spinBonus = 1;
       tx.set(ref.collection('history').doc(), {
         type: 'bonus', amount: 0, description: 'Nömrə doğrulama: 1 PayÇarx', createdAt: FieldValue.serverTimestamp()
@@ -687,8 +604,6 @@ async function otpSend(req, res, isResend) {
     const phone = normPhoneAz(u.phone);
     if (!phone) return res.status(400).json({ success: false, error: 'Əvvəlcə düzgün nömrə əlavə edin' });
 
-    // Tək sahə üzrə sorğu (kompozit indeks tələb etmir) + yaddaşda süzgəc.
-    // Sorğu uğursuz olsa belə SMS göndərilməsi dayanmasın.
     try {
       const dup = await db.collection('users').where('phone', '==', phone).limit(10).get();
       if (dup.docs.some(d => d.id !== uid && d.data().phoneVerified === true)) {
@@ -707,7 +622,6 @@ async function otpSend(req, res, isResend) {
     if (sends.length >= OTP_MAX_SENDS_PER_HOUR) return res.status(429).json({ success: false, error: 'Saatlıq limit dolub, sonra yenidən cəhd edin' });
 
     if (SMS_SIMULATE) {
-      // Simulyasiya: real SMS yoxdur -> nömrə dərhal doğrulanır (tək sorğu)
       const out = await otpFinalize(uid, phone);
       return res.json({
         success: true, simulated: true, verified: true, phone, ...out,
@@ -715,13 +629,12 @@ async function otpSend(req, res, isResend) {
       });
     }
 
-    // OTPBAY: POST /v1/verifications {to}. (Təkrar göndərmə də yeni doğrulama yaradır.)
     const r = await otpApi('POST', '/verifications', { to: phone });
     if (!r.ok) return otpFail(res, r);
 
     const d = r.data || {};
     const otpId = otpPick(d, 'sid', 'id', 'verification_sid', 'verificationSid', 'otp_id');
-    if (!otpId) { console.error('[otp] cavabda sid yoxdur', d); return res.status(502).json({ success: false, error: 'SMS xidməti cavabı başa düşülmədi' }); }
+    if (!otpId) { return res.status(502).json({ success: false, error: 'SMS xidməti cavabı başa düşülmədi' }); }
     const completion = 'code';
     const actionUrl = null;
 
@@ -741,15 +654,12 @@ async function otpSend(req, res, isResend) {
   }
 }
 
-// Diaqnostika: açar işləyirmi? (brauzerdə aç: /api/otp/diag) — SMS göndərmir
 app.get(['/otp/diag', '/api/otp/diag'], async (req, res) => {
   if (!process.env.DIAG_TOKEN || !safeEq(req.headers['x-diag-token'], process.env.DIAG_TOKEN)) return res.status(404).json({ success: false });
   if (!otpIpAllowed(req.realIp || req.ip)) return res.status(429).json({ ok: false });
   const r = await otpApi('GET', '/verifications/VE00000000000000000000000000000000');
-  if (!OTP_API_KEY) return res.json({ ok: false, keyStatus: 'MISSING (Render-də OTP_API_KEY yoxdur)', base: OTP_BASE });
-  const keyStatus = r.status === 401 ? 'INVALID (açar yanlışdır / tətbiq söndürülüb / şirkət dayandırılıb)'
-    : r.status === 0 ? 'UNREACHABLE (api.otp.com-a qoşulmaq olmadı)'
-    : 'VALID (açar qəbul olundu)';
+  if (!OTP_API_KEY) return res.json({ ok: false, keyStatus: 'MISSING', base: OTP_BASE });
+  const keyStatus = r.status === 401 ? 'INVALID' : r.status === 0 ? 'UNREACHABLE' : 'VALID';
   res.json({
     ok: r.status !== 401 && r.status !== 0,
     keyStatus, httpStatus: r.status, base: OTP_BASE,
@@ -797,7 +707,6 @@ app.post(['/otp/verify', '/api/otp/verify'], authUser, async (req, res) => {
     if (dup.docs.some(d => d.id !== uid && d.data().phoneVerified === true)) return res.status(409).json({ success: false, error: 'Bu nömrə başqa hesabda doğrulanıb' });
 
     const out = await otpFinalize(uid, s.phone);
-    console.log('[otp] doğrulandı', uid, s.phone);
     res.json({ success: true, phone: s.phone, ...out });
   } catch (e) {
     console.error('[otp-verify]', e);
@@ -805,7 +714,6 @@ app.post(['/otp/verify', '/api/otp/verify'], authUser, async (req, res) => {
   }
 });
 
-// WhatsApp "inbound" rejimi üçün: status yoxlanır, təsdiqlənibsə eyni qaydada tamamlanır
 app.get(['/otp/status', '/api/otp/status'], authUser, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -827,10 +735,13 @@ app.get(['/otp/status', '/api/otp/status'], authUser, async (req, res) => {
   }
 });
 
-// ---------- Balansla kod alışı (server tərəfi, Admin SDK) ----------
-// Brauzer tərəfi Firestore qaydaları/indekslərdən asılı olub "xəta" verirdi. Burada hamısı bir atomik əməliyyatdır:
-// balans yoxlanır -> hovuzdan kodu OLAN sənəd seçilir -> balans çıxılır -> kod istifadəçiyə yazılır.
 const round2g = n => Math.round((Number(n) || 0) * 100) / 100;
+
+/* ═══════════════════════════════════════════════════════════════
+   BUG FIX #1: /buy-code — kod çatdırılması
+   - limit(10) → limit(30): orfan sənədlər sərhədi doldurmasın
+   - RESOURCE_EXHAUSTED → 503 + quota_exceeded
+   ═══════════════════════════════════════════════════════════════ */
 app.post(['/buy-code', '/api/buy-code'], authUser, uidLimit('buy', 12, 60000), async (req, res) => {
   try {
     const platform = req.body.platform === 'chcplay' ? 'chcplay' : 'fastloto';
@@ -850,7 +761,7 @@ app.post(['/buy-code', '/api/buy-code'], authUser, uidLimit('buy', 12, 60000), a
       if (bal + 0.0001 < amount) throw new Error('balance');
 
       const ps = await tx.get(db.collection('fastlotoCodes')
-        .where('amount', '==', amount).where('status', '==', 'available').limit(10));
+        .where('amount', '==', amount).where('status', '==', 'available').limit(30));
       let poolDoc = null, codeStr = '';
       for (const dd of ps.docs) {
         const sd = await tx.get(db.collection('fastlotoSecrets').doc(dd.id));
@@ -881,13 +792,16 @@ app.post(['/buy-code', '/api/buy-code'], authUser, uidLimit('buy', 12, 60000), a
     if (m === 'balance') return res.status(409).json({ success: false, error: 'balance' });
     if (m === 'banned') return res.status(403).json({ success: false, error: 'banned' });
     if (m === 'user_not_found') return res.status(404).json({ success: false, error: 'user_not_found' });
+    const code = String((e && e.code) || '');
+    if (code === '8' || /RESOURCE_EXHAUSTED|Quota exceeded/i.test(m || '')) {
+      console.error('[buy-code] Firestore kvotası dolub');
+      return res.status(503).json({ success: false, error: 'quota_exceeded', retryAfter: 3600 });
+    }
     console.error('[buy-code]', e);
     return res.status(500).json({ success: false, error: 'server_error' });
   }
 });
 
-// ---------- Admin əməliyyatları (balans düzəlişi / çarx vermə) ----------
-// Yalnız aktiv TAM admin (role != 'support') və ya super admin. Admin SDK qaydalardan asılı deyil.
 const SUPER_ADMIN_UID = process.env.SUPER_ADMIN_UID || 'dIxZVPfOLIPZW0xqtcTeg7JXRnN2';
 async function requireFullAdmin(req, res, next) {
   try {
@@ -945,19 +859,10 @@ app.post(['/admin/give-spins', '/api/admin/give-spins'], authUser, uidLimit('adm
   } catch (e) { adminErr(res, e, '[admin-give-spins]'); }
 });
 
-// BetaTransfer (kart-to-kart depozit): /betatransfer/create, /status, /callback
 require('./betatransfer-route')(app, { admin, db, authUser, uidLimit, callbackLimit, genYeKod, campaignActive });
-
-// PayÇarx (fırlatma) marşrutları: /spin-state, /spin
 require('./spin-route')(app, { admin, db });
-
-// E-poçt doğrulama (Firebase-in öz məktubu, uğurda 1 PayÇarx): /email-verify/send, /confirm
 require('./email-verify-route')(app, { admin, db });
-
-// Şifrə yeniləmə (e-mail kodu): /password-reset/lookup, /send, /confirm
 require('./password-reset-route')(app, { admin, db });
-
-// Son çıxarışlar (ana səhifə, yalnız real təsdiqlənmiş çıxarışlar, maskalanmış): /recent-payouts
 require('./payouts-route')(app, { db });
 
 function withTimeout(promise, ms) {
@@ -968,7 +873,6 @@ async function fsPing() {
   await withTimeout(db.collection('_health').doc('ping').get(), 25000);
   return Date.now() - t;
 }
-// Dərin yoxlama (cron üçün YOX, diaqnostika üçün): Firestore cavab verirmi?
 app.get(['/health/deep', '/api/health/deep'], async (req, res) => {
   try { res.json({ ok: true, firestoreMs: await fsPing(), p2: !!db2 }); }
   catch (e) { res.status(503).json({ ok: false, error: String(e && e.message || e) }); }
@@ -982,9 +886,10 @@ app.use((err, req, res, next) => { console.error('[express]', err); res.status(5
 process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
 process.on('uncaughtException', e => console.error('[uncaughtException]', e));
 
-// ---------- Kampaniya səbəti: campaignCodes -> 2-ci layihədə TƏK sənəd (public/campaignBasket) ----------
-// Brauzerlər 1000 sənəd əvəzinə 2-ci layihədən 1 sənəd oxuyur. 1-ci layihədən yalnız YENİ kodlar oxunur.
-const BASKET_MAX = 1000;
+/* ═══════════════════════════════════════════════════════════════
+   BUG FIX #2: Basket sync — 5 dəq → 15 dəq, 1000 → 300
+   ═══════════════════════════════════════════════════════════════ */
+const BASKET_MAX = 300;
 let basketBusy = false, basketLastErr = '';
 async function syncCampaignBasket() {
   if (!db2 || basketBusy) return;
@@ -1015,40 +920,33 @@ async function syncCampaignBasket() {
     if (!changed) return;
     const items = [...map.values()].sort((a, b) => (b.s || 0) - (a.s || 0)).slice(0, BASKET_MAX);
     await withTimeout(ref2.set({ items, count: items.length, syncedMs: maxMs || Date.now(), updatedAt: FieldValue.serverTimestamp() }), 30000);
-    console.log('[basket] yeniləndi:', items.length, 'kod');
   } catch (e) {
     const m = String(e && e.message || e);
     if (m !== basketLastErr) console.warn('[basket] sinxron xətası:', m);
     basketLastErr = m;
   } finally { basketBusy = false; }
 }
-if (db2) { setTimeout(syncCampaignBasket, 20000); setInterval(syncCampaignBasket, 5 * 60 * 1000); }
+if (db2) { setTimeout(syncCampaignBasket, 60000); setInterval(syncCampaignBasket, 15 * 60 * 1000); }
 
 const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, '0.0.0.0', () => console.log(`Server ${PORT} portunda işləyir`));
-// Render-in proksisi bağlantını təkrar istifadə edir; Node-un 5 saniyəlik default-u təsadüfi 502 / "server cavab vermir" yaradırdı
 server.keepAliveTimeout = 120 * 1000;
 server.headersTimeout = 125 * 1000;
 
-// ---- Firestore / Auth "isti" saxlanılır (soyuq start və boş qalmış gRPC bağlantısı ilk sorğunu 30-60 san asırdı) ----
 fsPing().then(ms => console.log('[warmup] Firestore hazırdır,', ms, 'ms')).catch(e => console.warn('[warmup] Firestore:', e.message));
-withTimeout(admin.auth().getUserByEmail('warmup@yevroloto.app'), 25000).catch(() => {});
+
 let fsFails = 0;
 setInterval(() => {
   fsPing().then(ms => { if (fsFails) console.log('[keepwarm] Firestore bərpa olundu,', ms, 'ms'); fsFails = 0; })
     .catch(e => {
       const msg = String(e && e.message || e);
-      if (/RESOURCE_EXHAUSTED|Quota/i.test(msg)) {      // kvota dolub: yenidən başlatmaq kömək etmir
-        console.error('[QUOTA] Firestore gündəlik limiti dolub. Firebase-də Blaze planına keçin və ya limitin sıfırlanmasını gözləyin.');
+      if (/RESOURCE_EXHAUSTED|Quota/i.test(msg)) {
+        console.error('[QUOTA] Firestore gündəlik limiti dolub.');
         return;
       }
       fsFails++;
-      console.warn('[keepwarm] Firestore cavab vermədi #' + fsFails, msg);
-      // Bağlantı "ilişib" qalıbsa ardıcıl 3 uğursuzluqdan sonra proses yenidən başladılır (Render avtomatik qaldırır)
-      if (fsFails >= 3) { console.error('[watchdog] Firestore 3 dəfə cavab vermədi — proses yenidən başladılır'); setTimeout(() => process.exit(1), 500); }
+      if (fsFails >= 3) { console.error('[watchdog] Firestore 3 dəfə cavab vermədi'); setTimeout(() => process.exit(1), 500); }
     });
-}, 5 * 60 * 1000);
+}, 15 * 60 * 1000);
 
-// Render pulsuz planda yatmasın deyə hər 4 dəqiqədən bir özünü çağırır (kənar cron ilə birlikdə)
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || '';
-if (SELF_URL) setInterval(() => { fetch(SELF_URL + '/health', { signal: AbortSignal.timeout(15000) }).catch(() => {}); }, 4 * 60 * 1000);
+/* BUG FIX #3: Self-ping SİLİNDİ (Render TOS-a ziddir) */

@@ -1,49 +1,16 @@
-/**
- * PayÇarx — SERVER TƏRƏFİ (Render-dəki pay4bit serverinə əlavə et).
- *
- * Niyə lazımdır: çarxın bütün məntiqi əvvəl brauzerdə idi (fırlatma sayı, pulsuz fırlatma
- * vaxtı, təsadüfi nəticə). İstifadəçi həm cihaz saatını dəyişərək, həm də DevTools ilə
- * `payWheelSpins` sahəsini birbaşa yazaraq sonsuz fırlada bilirdi. İndi hər şeyi YALNIZ
- * server həll edir: server saatı, server təsadüfiliyi, atomik Firestore transaction.
- *
- * Qoşulması (server faylında, cors() və auth hazırlığından sonra, listen()-dən əvvəl):
- *
- *   const registerSpinRoutes = require('./spin-route');
- *   registerSpinRoutes(app, { admin, db });   // admin = firebase-admin, db = admin.firestore()
- *
- * QAYDALAR (yeni):
- *   1) Qeydiyyat hədiyyəsi (1 dəfəlik PayÇarx) YALNIZ aşağıdakı şərtlərin HAMISI ödənəndə verilir:
- *        a) hesabın telefon nömrəsi SMS ilə doğrulanıb (phoneVerified === true);
- *        b) hədiyyə alan IP ünvan yenidir (eyni IP-dən əvvəl hədiyyə alınmayıb);
- *        c) hədiyyə alan cihaz yenidir (eyni cihazdan əvvəl hədiyyə alınmayıb);
- *        d) qeydiyyatdan WELCOME_DELAY_MS keçib (standart 24 saat; env ilə dəyişir, 0 = dərhal).
- *      Claim qeydləri `welcomeClaims` kolleksiyasında saxlanır (yalnız server yazır/oxuyur).
- *   2) Hər 24 saatdan bir pulsuz fırlatma LƏĞV edilib. İstisna: profil səviyyəsi MATRIX (>= 5000 xal)
- *      olanlara hər 24 saatdan bir pulsuz fırlatma verilir.
- *   3) Hər uğurlu DEPOZİT 1 fırlatma açır (server.js callback-də).
- *   4) Qazanc faizi endirilib (aşağıdakı çəkilər).
- *
- * Yeni endpoint-lər (hər ikisi `Authorization: Bearer <Firebase ID token>` tələb edir):
- *   POST /spin-state  (və /api/spin-state)  -> pulsuz fırlatmanı yoxlayır/verir, vəziyyəti qaytarır
- *   POST /spin        (və /api/spin)        -> 1 fırlatma xərcləyir, nəticəni qaytarır
- */
 'use strict';
-
 const crypto = require('crypto');
 
 const FREE_SPIN_MS = 24 * 60 * 60 * 1000;
-const MATRIX_POINTS = 5000;   // admin.html RANKS: Matrix = 5000 xal
+const MATRIX_POINTS = 5000;
 
-/* Qeydiyyat hədiyyəsi qorunması (SMS + yeni IP + yeni cihaz) */
 const WELCOME_DELAY_MS = process.env.WELCOME_DELAY_MS !== undefined && process.env.WELCOME_DELAY_MS !== ''
   ? Math.max(0, Number(process.env.WELCOME_DELAY_MS) || 0) : FREE_SPIN_MS;
-const WELCOME_MAX_PER_IP = Math.max(1, Number(process.env.WELCOME_MAX_PER_IP) || 1);       // 1 IP -> neçə hesab hədiyyə ala bilər
-const WELCOME_MAX_PER_DEVICE = Math.max(1, Number(process.env.WELCOME_MAX_PER_DEVICE) || 1); // 1 cihaz -> neçə hesab
+const WELCOME_MAX_PER_IP = Math.max(1, Number(process.env.WELCOME_MAX_PER_IP) || 1);
+const WELCOME_MAX_PER_DEVICE = Math.max(1, Number(process.env.WELCOME_MAX_PER_DEVICE) || 1);
 const CLAIM_SALT = process.env.WELCOME_CLAIM_SALT || 'yevrolato-welcome-v1';
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
-/* DİQQƏT: sıra və say paycarx.html-dəki SEGMENTS ilə EYNİ olmalıdır (client yalnız indeksi alır
-   və bucaqlara görə fırladır). Çəkiləri (w) YALNIZ buradan dəyiş. */
 const SEGMENTS = [
   { type: 'money',  value: 1,   label: '1 AZN',                w: 18, nw: 10 },
   { type: 'spin',   value: 2,   label: 'PayÇarx 2 dəfə',       w: 1,  nw: 0  },
@@ -57,14 +24,11 @@ const SEGMENTS = [
   { type: 'points', value: 50,  label: '50 level xalı',        w: 10, nw: 32 },
   { type: 'money',  value: 10,  label: '10 AZN',               w: 1,  nw: 0  }
 ];
-/* w  = depozit edmiş istifadəçilər üçün (çəkilər cəmi 100; orta pul qazancı ~0.98 AZN, əvvəl ~1.25)
-   nw = hələ depozit etməyənlər üçün (cəmi 100; orta ~1.01 AZN, əvvəl ~1.35): böyük mükafatlar bağlıdır */
 const TOTAL_W = SEGMENTS.reduce((a, s) => a + s.w, 0);
 const TOTAL_NW = SEGMENTS.reduce((a, s) => a + s.nw, 0);
 
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
-/* Kriptoqrafik təsadüfilik (Math.random əvəzinə) */
 function pickSegment(deposited = true, rand = crypto.randomInt) {
   const key = deposited ? 'w' : 'nw';
   const total = deposited ? TOTAL_W : TOTAL_NW;
@@ -76,7 +40,6 @@ function pickSegment(deposited = true, rand = crypto.randomInt) {
   return SEGMENTS.length - 1;
 }
 
-/* Qeydiyyat vaxtı (ms). */
 function createdMs(d, now) {
   let c = 0;
   if (d.createdAt && typeof d.createdAt.toMillis === 'function') c = d.createdAt.toMillis();
@@ -84,21 +47,9 @@ function createdMs(d, now) {
   return c;
 }
 
-/* Hesab MATRIX səviyyəsindədirmi? (səviyyə `points` sahəsinə görə hesablanır) */
 function isMatrix(d) { return (Number(d.points) || 0) >= MATRIX_POINTS; }
-
-/* Qeydiyyat hədiyyəsi artıq istifadə olunubmu?
-   Köhnə hesablar (artıq bir dəfə pulsuz fırladanlar, lastSpinAtMs > 0) da "istifadə olunub" sayılır. */
 function welcomeDone(d) { return d.welcomeSpinGiven === true || (Number(d.lastSpinAtMs) || 0) > 0; }
 
-/* PayÇarx hüququ (SAF funksiya):
-   - qeydiyyat hədiyyəsi: hər hesaba 1 dəfə; SMS doğrulaması + yeni IP + yeni cihaz + gözləmə müddəti tələb olunur;
-   - MATRIX: hər 24 saatdan bir 1 pulsuz fırlatma (yalnız fırlatma qalmayanda);
-   - digər hamı üçün gündəlik pulsuz fırlatma YOXDUR — yalnız depozit fırlatma açır.
-   gate: IP/cihaz yoxlamasının nəticəsi (welcomeGate). null verilibsə və hədiyyə vaxtı çatıbsa,
-         `welcomeDue: true` qaytarılır — çağıran yoxlamanı edib funksiyanı gate ilə yenidən çağırmalıdır.
-   mode: 'welcome_sms' (nömrə doğrulanmayıb) | 'welcome' (gözləmə) | 'welcome_blocked' (IP/cihaz artıq istifadə olunub)
-         | 'welcome_device' (cihaz identifikatoru yoxdur) | 'matrix' | 'deposit' */
 function resolveSpins(d, now, gate) {
   let spins = Math.max(0, Math.floor(Number(d.payWheelSpins) || 0));
   const upd = {};
@@ -110,8 +61,8 @@ function resolveSpins(d, now, gate) {
 
   if (spins === 0) {
     if (!welcomeDone(d)) {
-      if (d.phoneVerified !== true) {
-        mode = 'welcome_sms';                    // əvvəl SMS ilə nömrəni doğrula
+      if (d.phoneVerified !== true && d.emailVerified !== true) {
+        mode = 'welcome_sms';
       } else {
         const at = createdMs(d, now) + WELCOME_DELAY_MS;
         if (now < at) { nextFreeAtMs = at; mode = 'welcome'; }
@@ -122,7 +73,7 @@ function resolveSpins(d, now, gate) {
       }
     } else if (matrix) {
       let last = Number(d.lastDailySpinAtMs) || 0;
-      if (last > now) last = now;            // saat hiyləsi: gələcək vaxt "indi"yə endirilir
+      if (last > now) last = now;
       const at = last + FREE_SPIN_MS;
       if (!last || now >= at) { spins = 1; upd.payWheelSpins = 1; upd.lastDailySpinAtMs = now; }
       else { nextFreeAtMs = at; mode = 'matrix'; }
@@ -131,7 +82,6 @@ function resolveSpins(d, now, gate) {
   return { spins, upd, nextFreeAtMs, mode, matrix, welcomeDue, welcomeGranted };
 }
 
-/* Nəticənin tətbiqi. SAF funksiya (test üçün ayrılıb). */
 function applyPrize(d, spinsBefore, idx, now) {
   const prize = SEGMENTS[idx];
   const upd = {
@@ -156,7 +106,7 @@ function publicState(d, upd, spins, info, now) {
   return {
     spins,
     nextFreeAtMs: spins > 0 ? 0 : (info.nextFreeAtMs || 0),
-    freeMode: spins > 0 ? 'ready' : info.mode,      // welcome | matrix | deposit | ready
+    freeMode: spins > 0 ? 'ready' : info.mode,
     isMatrix: isMatrix(merged),
     phoneVerified: merged.phoneVerified === true,
     matrixPoints: MATRIX_POINTS,
@@ -180,7 +130,6 @@ function registerSpinRoutes(app, { admin, db }) {
   const cleanIp = (ip) => String(ip || '').replace(/^::ffff:/i, '').trim();
   const getDeviceId = (req) => String((req.body && req.body.deviceId) || '').trim();
 
-  /* Qeydiyyat hədiyyəsi üçün IP + cihaz yoxlaması. Transaction daxilində OXUMA (yazma sonra, handler-də). */
   async function welcomeGate(tx, uid, ip, deviceId) {
     if (!DEVICE_ID_RE.test(deviceId || '')) return { ok: false, reason: 'welcome_device' };
     if (!ip) return { ok: false, reason: 'welcome_blocked' };
@@ -199,12 +148,11 @@ function registerSpinRoutes(app, { admin, db }) {
     tx.set(gate.ipRef, { kind: 'ip', uids: add(gate.ipUids), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
     tx.set(gate.devRef, { kind: 'device', uids: add(gate.devUids), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
   }
-  /* resolveSpins + (lazım olsa) IP/cihaz yoxlaması */
   async function resolveWithGate(tx, d, uid, now, req) {
     let info = resolveSpins(d, now, null);
     let gate = null;
     if (info.welcomeDue) {
-      gate = await welcomeGate(tx, uid, cleanIp(req.ip), getDeviceId(req));
+      gate = await welcomeGate(tx, uid, cleanIp(req.realIp || req.ip), getDeviceId(req));
       info = resolveSpins(d, now, gate);
     }
     return { info, gate };
@@ -212,28 +160,42 @@ function registerSpinRoutes(app, { admin, db }) {
 
   function fail(res, status, code) { return res.status(status).json({ success: false, error: code }); }
 
+  /* ═══════════════════════════════════════════════════════════════
+     BUG FIX: mapError — quota üçün ayrı 503 qaytarır
+     ═══════════════════════════════════════════════════════════════ */
   function mapError(res, e) {
     const m = e && e.message;
     if (m === 'user_not_found') return fail(res, 404, 'user_not_found');
     if (m === 'banned')         return fail(res, 403, 'banned');
     if (m === 'no_spins')       return fail(res, 409, 'no_spins');
+    const code = String((e && e.code) || '');
+    if (code === '8' || /RESOURCE_EXHAUSTED|Quota exceeded/i.test(m || '')) {
+      console.error('[spin] Firestore kvotası dolub');
+      return fail(res, 503, 'quota_exceeded');
+    }
     console.error('[spin] error:', e);
     return fail(res, 500, 'server_error');
   }
 
-  /* İstifadəçi depozit edibmi? (bayraq və ya uğurlu depozit ödənişi) */
+  /* ═══════════════════════════════════════════════════════════════
+     BUG FIX: userHasDeposited — limit(1).get() → count()
+     quota baxımından 1/1000 yüngülləşdirmə
+     ═══════════════════════════════════════════════════════════════ */
   async function userHasDeposited(ref, uid) {
     try {
       const u = await ref.get();
       if (u.exists && u.data().hasDeposited === true) return true;
-      const q = await db.collection('payments')
-        .where('uid', '==', uid).where('purpose', '==', 'deposit').where('status', '==', 'paid').limit(1).get();
-      if (!q.empty) { try { await ref.update({ hasDeposited: true }); } catch (_) {} return true; }
+      const cSnap = await db.collection('payments')
+        .where('uid', '==', uid).where('purpose', '==', 'deposit').where('status', '==', 'paid')
+        .count().get();
+      if (cSnap.data().count > 0) {
+        try { await ref.update({ hasDeposited: true }); } catch (_) {}
+        return true;
+      }
     } catch (e) { console.warn('[spin] deposit check:', e.message); }
     return false;
   }
 
-  /* Vəziyyət + pulsuz fırlatma yoxlaması */
   async function stateHandler(req, res) {
     const uid = await uidFromReq(req);
     if (!uid) return fail(res, 401, 'unauthorized');
@@ -245,7 +207,7 @@ function registerSpinRoutes(app, { admin, db }) {
         const d = snap.data();
         if (d.banned === true) throw new Error('banned');
         const now = Date.now();
-        const { info, gate } = await resolveWithGate(tx, d, uid, now, req);   // oxumalar yazmalardan əvvəl
+        const { info, gate } = await resolveWithGate(tx, d, uid, now, req);
         if (Object.keys(info.upd).length) tx.update(ref, info.upd);
         if (info.welcomeGranted && gate && gate.ok) writeWelcomeClaims(tx, gate, uid);
         return publicState(d, info.upd, info.spins, info, now);
@@ -254,7 +216,6 @@ function registerSpinRoutes(app, { admin, db }) {
     } catch (e) { return mapError(res, e); }
   }
 
-  /* Fırlatma */
   async function spinHandler(req, res) {
     const uid = await uidFromReq(req);
     if (!uid) return fail(res, 401, 'unauthorized');
@@ -273,7 +234,7 @@ function registerSpinRoutes(app, { admin, db }) {
 
         const idx = pickSegment(dep);
         const { upd, alreadyX2, prize } = applyPrize(d, free.spins, idx, now);
-        Object.assign(upd, free.upd);          // welcomeSpinGiven / lastDailySpinAtMs eyni əməliyyatda yazılır
+        Object.assign(upd, free.upd);
         upd.payWheelSpins = free.spins - 1 + (prize.type === 'spin' ? prize.value : 0);
         tx.update(ref, upd);
         if (free.welcomeGranted && gate && gate.ok) writeWelcomeClaims(tx, gate, uid);
@@ -302,5 +263,4 @@ function registerSpinRoutes(app, { admin, db }) {
 }
 
 module.exports = registerSpinRoutes;
-/* test üçün */
 module.exports._internals = { SEGMENTS, TOTAL_W, TOTAL_NW, FREE_SPIN_MS, WELCOME_DELAY_MS, WELCOME_MAX_PER_IP, WELCOME_MAX_PER_DEVICE, MATRIX_POINTS, pickSegment, resolveSpins, applyPrize, isMatrix, welcomeDone };
