@@ -707,15 +707,11 @@ async function otpSend(req, res, isResend) {
     if (sends.length >= OTP_MAX_SENDS_PER_HOUR) return res.status(429).json({ success: false, error: 'Saatlıq limit dolub, sonra yenidən cəhd edin' });
 
     if (SMS_SIMULATE) {
-      const code = String(crypto.randomInt(100000, 1000000));
-      await sref.set({
-        simulated: true, codeHash: simHash(uid, phone, code), expiresAt: now + SIM_CODE_TTL_MS,
-        phone, sends: [...sends, now], attempts: 0, channel: 'sms', completion: 'code',
-        updatedAt: FieldValue.serverTimestamp()
-      });
+      // Simulyasiya: real SMS yoxdur -> nömrə dərhal doğrulanır (tək sorğu)
+      const out = await otpFinalize(uid, phone);
       return res.json({
-        success: true, simulated: true, code, completion: 'code', actionUrl: null,
-        channel: 'sms', maskedRecipient: '', phone, cooldown: OTP_COOLDOWN_MS / 1000
+        success: true, simulated: true, verified: true, phone, ...out,
+        completion: 'code', actionUrl: null, channel: 'sms', maskedRecipient: '', cooldown: 0
       });
     }
 
@@ -773,13 +769,12 @@ app.post(['/otp/verify', '/api/otp/verify'], authUser, async (req, res) => {
     if (code.length < 4 || code.length > 8) return res.status(400).json({ success: false, error: '6 rəqəmli kodu daxil edin' });
 
     const sref = db.collection('otpSessions').doc(uid);
-    const s = (await sref.get()).data();
+    const [ss, us] = await Promise.all([sref.get(), db.collection('users').doc(uid).get()]);
+    const s = ss.data();
+    const u = us.exists ? us.data() : {};
+    if (u.phoneVerified === true) return res.json({ success: true, phone: u.phone || '', bonus: 0, spinBonus: 0, spins: Math.max(0, Math.floor(Number(u.payWheelSpins) || 0)), points: Number(u.points) || 0 });
     if (!s || (!s.otpId && !s.simulated)) return res.status(400).json({ success: false, error: 'Əvvəlcə kod göndərin' });
     if ((s.attempts || 0) >= OTP_MAX_ATTEMPTS) return res.status(429).json({ success: false, error: 'Çox yanlış cəhd. Yeni kod göndərin' });
-
-    const us = await db.collection('users').doc(uid).get();
-    const u = us.exists ? us.data() : {};
-    if (u.phoneVerified === true) return res.json({ success: true, phone: u.phone || '', bonus: 0, spinBonus: 0, points: Number(u.points) || 0 });
     if (normPhoneAz(u.phone) !== s.phone) return res.status(409).json({ success: false, error: 'Nömrə dəyişib, yenidən kod göndərin' });
 
     let matched = false;

@@ -35,7 +35,7 @@ async function idt(path, body) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Firebase-Locale': 'az', Referer: REFERER },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15000)
+    signal: AbortSignal.timeout(10000)
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
@@ -108,28 +108,51 @@ module.exports = function registerEmailVerifyRoutes(app, { admin, db }) {
     if (now - hourStart > 3600000) { hourStart = now; hourCount = 0; }
     if (hourCount >= MAX_SENDS_PER_HOUR) throw new HttpErr(429, 'Çox cəhd edildi. 1 saat sonra yoxlayın', { retryAfter: 3600 });
 
-    // Bu e-poçtla Firebase Auth-da artıq hesab varsa: yalnız bizim müvəqqəti doğrulama hesabını yenidən yaradırıq
-    try {
-      const ex = await admin.auth().getUserByEmail(email);
-      if (ex.displayName !== MARK) throw new HttpErr(409, 'Bu e-poçt ilə doğrulama mümkün deyil. Başqa e-poçt yazın');
-      await admin.auth().deleteUser(ex.uid);
-    } catch (e) {
-      if (e instanceof HttpErr) throw e;
-      if (!(e && e.code === 'auth/user-not-found')) throw e;
+    // Müvəqqəti doğrulama hesabı: varsa sıfırlanır, yoxdursa yaradılır (delete+create əvəzinə 1 sorğu)
+    let tmp = null;
+    try { tmp = await admin.auth().getUserByEmail(email); }
+    catch (e) { if (!(e && e.code === 'auth/user-not-found')) throw e; }
+    const pw = crypto.randomBytes(24).toString('base64url');
+    if (tmp) {
+      if (tmp.displayName !== MARK) throw new HttpErr(409, 'Bu e-poçt ilə doğrulama mümkün deyil. Başqa e-poçt yazın');
+      await admin.auth().updateUser(tmp.uid, { emailVerified: false, password: pw });
+    } else {
+      await admin.auth().createUser({ email, password: pw, displayName: MARK, emailVerified: false });
     }
 
-    const pw = crypto.randomBytes(24).toString('base64url');
-    await admin.auth().createUser({ email, password: pw, displayName: MARK, emailVerified: false });
-    try {
-      const si = await idt('accounts:signInWithPassword', { email, password: pw, returnSecureToken: true });
-      await idt('accounts:sendOobCode', { requestType: 'VERIFY_EMAIL', idToken: si.idToken });
-    } catch (e) {
-      console.error('[email-verify] Firebase məktub xətası:', e.message);
-      try { await admin.auth().deleteUser((await admin.auth().getUserByEmail(email)).uid); } catch (_) {}
-      const code = e.fbCode || '';
-      if (/TOO_MANY_ATTEMPTS/i.test(code)) throw new HttpErr(429, 'Çox cəhd edildi, bir az sonra yenidən yoxlayın');
-      if (/INVALID_EMAIL/i.test(code)) throw new HttpErr(400, 'E-poçt ünvanı düzgün deyil');
-      throw new HttpErr(502, 'E-poçt göndərilmədi, bir az sonra yenidən yoxlayın');
+    // Render-də BREVO_API_KEY + MAIL_FROM varsa link Brevo ilə göndərilir (spam-a düşmür). Yoxdursa Firebase məktubu.
+    let sent = false;
+    const bKey = String(process.env.BREVO_API_KEY || '').trim(), bFrom = String(process.env.MAIL_FROM || '').trim();
+    if (bKey && bFrom) {
+      try {
+        const link = await admin.auth().generateEmailVerificationLink(email);
+        const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST',
+          headers: { 'api-key': bKey, 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({
+            sender: { name: process.env.MAIL_FROM_NAME || 'YevroLato', email: bFrom },
+            to: [{ email }],
+            subject: 'YevroLato — e-poçtu təsdiq edin',
+            textContent: `E-poçtunuzu təsdiq etmək üçün linkə toxunun:\n${link}\n\nSonra YevroLato-ya qayıdıb "Təsdiq etdim" düyməsinə basın.`,
+            htmlContent: `<div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:24px;border-radius:14px;background:#06261b;color:#e8f6ee"><h2 style="margin:0 0 12px;color:#e6c87a">YevroLato</h2><p>E-poçtunuzu təsdiq etmək üçün düyməyə toxunun:</p><p style="margin:18px 0"><a href="${link}" style="background:#e6c87a;color:#06261b;padding:12px 22px;border-radius:10px;text-decoration:none;font-weight:700">E-poçtu təsdiq et</a></p><p style="color:#8fb3a3;font-size:13px">Sonra YevroLato-ya qayıdıb "Təsdiq etdim" düyməsinə basın.</p></div>`
+          }),
+          signal: AbortSignal.timeout(10000)
+        });
+        if (!r.ok) throw new Error('Brevo ' + r.status);
+        sent = true;
+      } catch (e) { console.error('[email-verify] Brevo alınmadı, Firebase məktubuna keçilir:', e && e.message); }
+    }
+    if (!sent) {
+      try {
+        const si = await idt('accounts:signInWithPassword', { email, password: pw, returnSecureToken: true });
+        await idt('accounts:sendOobCode', { requestType: 'VERIFY_EMAIL', idToken: si.idToken });
+      } catch (e) {
+        console.error('[email-verify] Firebase məktub xətası:', e && e.message);
+        const code = (e && e.fbCode) || '';
+        if (/TOO_MANY_ATTEMPTS/i.test(code)) throw new HttpErr(429, 'Çox cəhd edildi, bir az sonra yenidən yoxlayın');
+        if (/INVALID_EMAIL/i.test(code)) throw new HttpErr(400, 'E-poçt ünvanı düzgün deyil');
+        throw new HttpErr(502, 'E-poçt göndərilmədi, bir az sonra yenidən yoxlayın');
+      }
     }
 
     await ref.set({ email, sentAt: now, hourStart, hourCount: hourCount + 1 });
