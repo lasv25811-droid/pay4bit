@@ -1,10 +1,5 @@
 /**
- * YevroLato – Pay4bit backend (v3)
- * - 3 Firebase layihəsi: primary / basket / analytics
- * - Pay Çarx SİLİNDİ
- * - Email verify SİLİNDİ
- * - P2P (USDT+BTC) depozit + BTC çıxarış + Hədiyyə qutusu
- * - Region detection (Cloudflare cf-ipcountry)
+ * YevroLato – Pay4bit backend
  */
 try { require('dns').setDefaultResultOrder('ipv4first'); } catch (_) {}
 const express = require('express');
@@ -16,10 +11,11 @@ const admin = require('firebase-admin');
 const PUBLIC_KEY = process.env.PAY4BIT_PUBLIC_KEY || '';
 const SECRET_KEY = process.env.PAY4BIT_SECRET_KEY || '';
 if (!PUBLIC_KEY || !SECRET_KEY) {
-  console.error('PAY4BIT_PUBLIC_KEY / PAY4BIT_SECRET_KEY təyin olunmayıb.');
+  console.error('PAY4BIT_PUBLIC_KEY / PAY4BIT_SECRET_KEY mühit dəyişənləri təyin olunmayıb.');
   process.exit(1);
 }
 
+const FIREBASE_SA = null;
 const PAY4BIT_URL = 'https://api.pay4bit.net/pay';
 const CHARGE_CURRENCY = 'EUR';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -46,51 +42,44 @@ const COMMISSION_FIXED_EUR = {
 const MAX_AZN = 2000;
 const MIN_CHARGE = 1;
 
-/* ═══════════════════════════════════════════════════════════
-   3 FIREBASE LAYİHƏSİ (oxuma/yazma yükü bölünür)
-   ═══════════════════════════════════════════════════════════ */
-function loadSA(envB64, envJson) {
-  try {
-    const raw = envB64 ? Buffer.from(envB64, 'base64').toString('utf8') : envJson;
-    if (!raw || !String(raw).trim()) return null;
-    const sa = JSON.parse(String(raw).trim());
-    sa.private_key = String(sa.private_key || '').replace(/\\n/g, '\n');
-    return sa;
-  } catch (e) { console.error('SA parse xətası:', e.message); return null; }
+let SA = null;
+try {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_B64
+    ? Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8')
+    : process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (raw && raw.trim()) SA = JSON.parse(raw.trim());
+} catch (e) {
+  console.error('FIREBASE_SERVICE_ACCOUNT JSON kimi oxunmadı:', e.message);
 }
-const SA1 = loadSA(process.env.FIREBASE_SERVICE_ACCOUNT_B64, process.env.FIREBASE_SERVICE_ACCOUNT);
-const SA2 = loadSA(process.env.FIREBASE_SERVICE_ACCOUNT_2_B64, process.env.FIREBASE_SERVICE_ACCOUNT_2);
-const SA3 = loadSA(process.env.FIREBASE_SERVICE_ACCOUNT_3_B64, process.env.FIREBASE_SERVICE_ACCOUNT_3);
+if (!SA) SA = FIREBASE_SA;
+if (!SA || !SA.private_key || !SA.client_email) {
+  console.error('Firebase service account tapılmadı və ya natamamdır.');
+  process.exit(1);
+}
+SA.private_key = String(SA.private_key).replace(/\\n/g, '\n');
 
-if (!SA1) { console.error('Primary Firebase SA yoxdur.'); process.exit(1); }
-
-const app1 = admin.initializeApp({ credential: admin.credential.cert(SA1) }, 'p1');
-const db  = app1.firestore();
+admin.initializeApp({ credential: admin.credential.cert(SA) });
+const db = admin.firestore();
 try { db.settings({ ignoreUndefinedProperties: true }); } catch (_) {}
 const FieldValue = admin.firestore.FieldValue;
 
-let dbBasket = null;
-if (SA2) {
-  try {
+// 2-ci Firebase layihəsi (yevrolato2)
+let db2 = null;
+try {
+  const raw2 = process.env.FIREBASE_SERVICE_ACCOUNT_2_B64
+    ? Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_2_B64, 'base64').toString('utf8')
+    : process.env.FIREBASE_SERVICE_ACCOUNT_2;
+  if (raw2 && raw2.trim()) {
+    const SA2 = JSON.parse(raw2.trim());
+    SA2.private_key = String(SA2.private_key || '').replace(/\\n/g, '\n');
     const app2 = admin.initializeApp({ credential: admin.credential.cert(SA2) }, 'p2');
-    dbBasket = app2.firestore();
-    try { dbBasket.settings({ ignoreUndefinedProperties: true }); } catch (_) {}
-    console.log('[p2] basket Firebase qoşuldu:', SA2.project_id);
-  } catch (e) { console.error('[p2]', e.message); }
-} else { console.log('[p2] verilməyib — basket primary-də işləyəcək'); }
-
-let dbAnalytics = null;
-if (SA3) {
-  try {
-    const app3 = admin.initializeApp({ credential: admin.credential.cert(SA3) }, 'p3');
-    dbAnalytics = app3.firestore();
-    try { dbAnalytics.settings({ ignoreUndefinedProperties: true }); } catch (_) {}
-    console.log('[p3] analytics Firebase qoşuldu:', SA3.project_id);
-  } catch (e) { console.error('[p3]', e.message); }
-} else { console.log('[p3] verilməyib — analytics primary-də işləyəcək'); }
-
-const DB_BASKET = dbBasket || db;      // public/basket yazıları
-const DB_ANALYTICS = dbAnalytics || db; // loq/analitika yazıları
+    db2 = app2.firestore();
+    try { db2.settings({ ignoreUndefinedProperties: true }); } catch (_) {}
+    console.log('[p2] 2-ci Firebase layihəsi qoşuldu:', SA2.project_id);
+  } else {
+    console.log('[p2] FIREBASE_SERVICE_ACCOUNT_2 verilməyib.');
+  }
+} catch (e) { console.error('[p2] qoşulmadı:', e.message); db2 = null; }
 
 const app = express();
 app.disable('x-powered-by');
@@ -102,12 +91,7 @@ function getClientIp(req) {
   const ip = pick(h['cf-connecting-ip']) || pick(h['true-client-ip']) || String(req.ip || '');
   return ip.replace(/^::ffff:/i, '');
 }
-app.use((req, res, next) => {
-  req.realIp = getClientIp(req);
-  // Cloudflare country header (pulsuz, dəqiq)
-  req.countryCode = String(req.headers['cf-ipcountry'] || '').toUpperCase().slice(0, 2);
-  next();
-});
+app.use((req, res, next) => { req.realIp = getClientIp(req); next(); });
 
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -143,36 +127,36 @@ app.use((req, res, next) => {
   req._stage = 'start';
   const t = setTimeout(() => {
     if (!res.headersSent) {
-      console.error(`[timeout] ${req.method} ${req.path} mərhələ=${req._stage}`);
+      console.error(`[timeout] 30 saniyədə cavab hazır olmadı: ${req.method} ${req.path} mərhələ=${req._stage}`);
       res.status(503).json({ success: false, error: 'Server məşğuldur, bir az sonra yenidən cəhd edin' });
     }
   }, 30000);
   const done = () => { clearTimeout(t); const ms = Date.now() - t0; if (ms > 5000) console.warn(`[slow] ${req.method} ${req.path} ${ms}ms mərhələ=${req._stage}`); };
-  res.on('finish', done); res.on('close', () => clearTimeout(t));
+  res.on('finish', done);
+  res.on('close', () => clearTimeout(t));
   next();
 });
 
-/* ═══════════════════════════════════════════════════════════
-   REGION HELPER (region.js-dən import)
-   ═══════════════════════════════════════════════════════════ */
-const region = require('./region');
-
-/* Valyuta məzənnəsi */
 let rateCache = { aznPerEur: null, at: 0, source: null };
 const RATE_TTL = 30 * 60 * 1000;
+
 function bakuDateParts(offsetDays = 0) {
   const d = new Date(Date.now() - offsetDays * 86400000);
   const parts = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Baku', day: '2-digit', month: '2-digit', year: 'numeric' })
     .formatToParts(d).reduce((a, p) => (a[p.type] = p.value, a), {});
   return `${parts.day}.${parts.month}.${parts.year}`;
 }
+
 async function fetchCbarEur() {
   for (let i = 0; i < 4; i++) {
     const r = await fetch(`https://www.cbar.az/currencies/${bakuDateParts(i)}.xml`, { signal: AbortSignal.timeout(6000) });
     if (!r.ok) continue;
     const xml = await r.text();
     const m = xml.match(/Code="EUR"[\s\S]*?<Nominal>([^<]+)<\/Nominal>[\s\S]*?<Value>([^<]+)<\/Value>/);
-    if (m) { const v = parseFloat(m[2]) / parseFloat(String(m[1]).replace(/\D/g, '') || '1'); if (v > 0) return v; }
+    if (m) {
+      const v = parseFloat(m[2]) / parseFloat(String(m[1]).replace(/\D/g, '') || '1');
+      if (v > 0) return v;
+    }
   }
   throw new Error('CBAR məzənnəsi tapılmadı');
 }
@@ -195,17 +179,6 @@ async function getAznPerEur() {
   }
   return rateCache;
 }
-let usdCache = { perEur: null, at: 0 };
-async function getUsdPerEur() {
-  if (usdCache.perEur && Date.now() - usdCache.at < RATE_TTL) return usdCache.perEur;
-  try {
-    const r = await fetch('https://open.er-api.com/v6/latest/EUR', { signal: AbortSignal.timeout(6000) });
-    const j = await r.json();
-    const v = j && j.rates && j.rates.USD;
-    if (v > 0) { usdCache = { perEur: v, at: Date.now() }; return v; }
-  } catch (_) {}
-  return usdCache.perEur || 1.08;
-}
 
 function aznToEur(azn, aznPerEur, commissionPercent, fixedEur) {
   const target = azn / aznPerEur;
@@ -223,10 +196,6 @@ function safeEq(a, b) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 const eqHex = (a, b) => safeEq(String(a || '').toLowerCase(), String(b || '').toLowerCase());
-
-function withTimeout(promise, ms) {
-  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout ' + ms + 'ms')), ms))]);
-}
 async function authUser(req, res, next) {
   try {
     const h = req.headers.authorization || '';
@@ -235,7 +204,7 @@ async function authUser(req, res, next) {
     req._stage = 'auth';
     try { req.user = await withTimeout(admin.auth().verifyIdToken(token), 15000); }
     catch (e) {
-      if (/^timeout/.test(String(e && e.message))) return res.status(503).json({ success: false, error: 'Server məşğuldur' });
+      if (/^timeout/.test(String(e && e.message))) { return res.status(503).json({ success: false, error: 'Server məşğuldur, bir az sonra yenidən cəhd edin' }); }
       throw e;
     }
     req._stage = 'handler';
@@ -252,7 +221,7 @@ function uidLimit(tag, max, windowMs) {
     let e = uidHits.get(k);
     if (!e || now - e.t > windowMs) e = { t: now, n: 0 };
     e.n++; uidHits.set(k, e);
-    if (e.n > max) return res.status(429).json({ success: false, error: 'Çox sorğu' });
+    if (e.n > max) return res.status(429).json({ success: false, error: 'Çox sorğu, bir az sonra yoxlayın' });
     next();
   };
 }
@@ -267,19 +236,6 @@ function callbackLimit(req, res, next) {
   next();
 }
 
-/* ═══════════════════════════════════════════════════════════
-   REGION ENDPOINT — Client dil və valyuta seçimi üçün
-   ═══════════════════════════════════════════════════════════ */
-app.get(['/region', '/api/region'], async (req, res) => {
-  try {
-    const info = region.resolveForRequest(req);
-    const rates = {};
-    try { const r = await getAznPerEur(); rates.aznPerEur = r.aznPerEur; } catch (_) {}
-    try { rates.usdPerEur = await getUsdPerEur(); } catch (_) {}
-    res.json({ success: true, ...info, rates });
-  } catch (e) { res.status(500).json({ success: false, error: 'Server xətası' }); }
-});
-
 app.get(['/rate', '/api/rate'], async (req, res) => {
   try {
     const r = await getAznPerEur();
@@ -287,10 +243,6 @@ app.get(['/rate', '/api/rate'], async (req, res) => {
   } catch (e) { res.status(503).json({ success: false, error: e.message }); }
 });
 
-/* ═══════════════════════════════════════════════════════════
-   CREATE-PAYMENT (Pay4bit) — YALNIZ AZ istifadəçiləri üçün AZN,
-   xaricdə EUR/USD. 2x bonus qalır.
-   ═══════════════════════════════════════════════════════════ */
 app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 10, 60000), async (req, res) => {
   try {
     const method = String(req.body.method || '');
@@ -298,45 +250,22 @@ app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 1
     const platform = req.body.platform === 'chcplay' ? 'chcplay' : 'fastloto';
     if (!(method in MIN_AZN)) return res.status(400).json({ success: false, error: 'Yanlış ödəniş üsulu' });
 
-    const curIn = String(req.body.currency || 'AZN').toUpperCase();
     const raw = String(req.body.amount ?? '').trim().replace(',', '.');
     if (!/^\d+(\.\d{1,2})?$/.test(raw)) return res.status(400).json({ success: false, error: 'Məbləğ yanlışdır' });
-    let amountInCurrency = Number(raw);
-
-    // Region: AZ və ya xarici
-    const rg = region.resolveForRequest(req);
-    // Xarici istifadəçi AZN istifadə edə bilməz, AZ istifadəçi EUR/USD istifadə edə bilməz (sadəlik üçün)
-    const allowed = rg.currencyOptions; // AZ üçün ['AZN'], xarici üçün ['EUR','USD']
-    if (!allowed.includes(curIn)) return res.status(400).json({ success: false, error: 'Bu valyuta icazəli deyil' });
-
-    // Minimum yoxla
-    const minAmt = purpose === 'deposit'
-      ? (method === 'card' ? MIN_DEPOSIT_CARD_AZN : MIN_AZN[method]) // AZN-də
-      : MIN_AZN[method];
-
-    let azn;
-    if (curIn === 'AZN') {
-      if (amountInCurrency < minAmt) return res.status(400).json({ success: false, error: `Minimum ${minAmt} AZN` });
-      if (amountInCurrency > MAX_AZN) return res.status(400).json({ success: false, error: `Maksimum ${MAX_AZN} AZN` });
-      azn = amountInCurrency;
-    } else {
-      // EUR/USD → AZN
-      const rates = await getAznPerEur().catch(() => ({ aznPerEur: 1.98 }));
-      const usdPerEur = await getUsdPerEur().catch(() => 1.08);
-      const eurAmount = curIn === 'EUR' ? amountInCurrency : amountInCurrency / usdPerEur;
-      const minEur = minAmt / rates.aznPerEur;
-      if (eurAmount < minEur) return res.status(400).json({ success: false, error: `Minimum ${minEur.toFixed(2)} ${curIn}` });
-      azn = eurAmount * rates.aznPerEur;
-      if (azn > MAX_AZN) return res.status(400).json({ success: false, error: 'Maksimum aşıldı' });
-    }
+    const azn = Number(raw);
+    const minNeeded = (purpose === 'deposit' && method === 'card') ? MIN_DEPOSIT_CARD_AZN : MIN_AZN[method];
+    if (azn < minNeeded) return res.status(400).json({ success: false, error: `Minimum ${minNeeded} AZN` });
+    if (azn > MAX_AZN) return res.status(400).json({ success: false, error: `Maksimum ${MAX_AZN} AZN` });
 
     const { aznPerEur, source } = await getAznPerEur();
     const commission = COMMISSION_PERCENT[method] || 0;
     const fixedFee = COMMISSION_FIXED_EUR[method] || 0;
     const amount = aznToEur(azn, aznPerEur, commission, fixedFee);
     const payerTotalEur = payerTotal(amount, commission, fixedFee);
-    console.log(`[create-payment] ${method} ${azn} AZN (${curIn}) | kurs ${aznPerEur} | ${amount} EUR`);
-    if (Number(amount) < MIN_CHARGE) return res.status(400).json({ success: false, error: 'Məbləğ Pay4bit minimumundan (1 EUR) azdır' });
+    console.log(`[create-payment] ${method} ${azn} AZN | kurs ${aznPerEur} | ${amount} EUR | səhifədə ≈ ${payerTotalEur} EUR`);
+    if (Number(amount) < MIN_CHARGE) {
+      return res.status(400).json({ success: false, error: 'Məbləğ Pay4bit minimumundan (1 EUR) azdır' });
+    }
 
     const orderId = Date.now().toString(36) + crypto.randomBytes(4).toString('hex');
     const account = orderId;
@@ -352,7 +281,7 @@ app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 1
     await db.collection('payments').doc(orderId).set({
       uid: req.user.uid, userName: uName, userUniqueId: uUnique, method, status: 'pending',
       purpose, platform, commissionPercent: commission, commissionFixedEur: fixedFee,
-      payerTotalEur, currencyIn: curIn,
+      payerTotalEur,
       aznAmount: azn, chargeAmount: amount, chargeCurrency: CHARGE_CURRENCY,
       aznPerEur, rateSource: source, desc, createdAt: FieldValue.serverTimestamp()
     });
@@ -362,12 +291,12 @@ app.post(['/create-payment', '/api/create-payment'], authUser, uidLimit('pay', 1
 
     res.json({
       success: true, orderId, purpose,
-      azn, charge: amount, currency: CHARGE_CURRENCY, aznPerEur, currencyIn: curIn,
+      azn, charge: amount, currency: CHARGE_CURRENCY, aznPerEur,
       redirect_url: `${PAY4BIT_URL}?${new URLSearchParams(params).toString()}`
     });
   } catch (e) {
     console.error('[create-payment]', e);
-    res.status(500).json({ success: false, error: 'Server xətası' });
+    res.status(500).json({ success: false, error: 'Server xətası, yenidən cəhd edin' });
   }
 });
 
@@ -377,7 +306,7 @@ app.get(['/payment-status', '/api/payment-status'], authUser, async (req, res) =
     if (!snap.exists || snap.data().uid !== req.user.uid) return res.status(404).json({ success: false });
     const d = snap.data();
     res.json({
-      success: true, status: d.status, azn: d.aznAmount, currencyIn: d.currencyIn || 'AZN',
+      success: true, status: d.status, azn: d.aznAmount,
       purpose: d.purpose || 'code', bonus: d.bonus || 0,
       codeStatus: d.codeStatus || null,
       code: d.codeStatus === 'delivered' ? d.code : null,
@@ -389,9 +318,6 @@ app.get(['/payment-status', '/api/payment-status'], authUser, async (req, res) =
   }
 });
 
-/* ═══════════════════════════════════════════════════════════
-   KAMPANİYA (Pay4bit callback üçün)
-   ═══════════════════════════════════════════════════════════ */
 const CAMPAIGN_END = new Date(process.env.CAMPAIGN_END_ISO || '2026-12-31T20:00:00Z');
 const CAMPAIGN_START = process.env.CAMPAIGN_START_ISO ? new Date(process.env.CAMPAIGN_START_ISO) : null;
 const YE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -406,9 +332,6 @@ function campaignActive() {
   return now < CAMPAIGN_END && (!CAMPAIGN_START || now >= CAMPAIGN_START);
 }
 
-/* ═══════════════════════════════════════════════════════════
-   PAY4BIT CALLBACK (depozit/kod üçün) — 2x bonus var
-   ═══════════════════════════════════════════════════════════ */
 async function pay4bitCallback(req, res) {
   const reply = (message, code = 200) => res.status(code).json({ result: { message } });
   try {
@@ -438,7 +361,8 @@ async function pay4bitCallback(req, res) {
       }
     }
     const okSign = signedSum !== null, okCheck = signedAmt !== null;
-    if (!okCheck && !okSign) return reply('Invalid signature', 400);
+
+    if (!okCheck && !okSign) { return reply('Invalid signature', 400); }
 
     const ref = db.collection('payments').doc(account);
     const snap = await ref.get();
@@ -459,6 +383,7 @@ async function pay4bitCallback(req, res) {
     }
 
     if (method === 'check') return reply('Request successfully processed');
+
     if (method === 'error') {
       if (order.status === 'pending') await ref.update({ status: 'failed', failedAt: FieldValue.serverTimestamp() });
       return reply('Request successfully processed');
@@ -488,13 +413,12 @@ async function pay4bitCallback(req, res) {
         if (purpose === 'deposit' && campaignActive()) {
           for (let i = 0; i < 6 && !campaignNew; i++) {
             const cand = genYeKod();
-            const cs = await tx.get(DB_BASKET.collection('campaignCodes').doc(cand));
+            const cs = await tx.get(db.collection('campaignCodes').doc(cand));
             if (!cs.exists) campaignNew = cand;
           }
         }
 
         const platform = order.platform || 'fastloto';
-        // Pay4bit depozitində: 2x bonus (ilk depozit "pending" idisə)
         const wheelPending = (u.firstDepositBonus === 'pending');
         const bonus = (purpose === 'deposit' || wheelPending) ? round2(order.aznAmount) : 0;
         const payUpdate = {
@@ -505,12 +429,12 @@ async function pay4bitCallback(req, res) {
         };
 
         const userUpd = { points: FieldValue.increment(order.aznAmount) };
+        if (purpose === 'deposit') userUpd.payWheelSpins = FieldValue.increment(1);
         let balanceAdd = 0;
         if (purpose === 'deposit') balanceAdd += order.aznAmount;
         if (bonus > 0) { balanceAdd += bonus; if (wheelPending) userUpd.firstDepositBonus = 'used'; }
         if (balanceAdd > 0) userUpd.balance = FieldValue.increment(round2(balanceAdd));
         if (purpose === 'deposit') userUpd.hasDeposited = true;
-        if (purpose === 'deposit') userUpd.totalDepositedAZN = FieldValue.increment(round2(order.aznAmount));
         tx.update(userRef, userUpd);
 
         if (purpose === 'deposit') {
@@ -520,7 +444,7 @@ async function pay4bitCallback(req, res) {
           });
         }
         if (campaignNew) {
-          tx.set(DB_BASKET.collection('campaignCodes').doc(campaignNew), {
+          tx.set(db.collection('campaignCodes').doc(campaignNew), {
             code: campaignNew, uniqueId: u.uniqueId || order.userUniqueId || '',
             source: 'deposit', orderId: account, amount: order.aznAmount, createdAt: FieldValue.serverTimestamp()
           });
@@ -529,7 +453,7 @@ async function pay4bitCallback(req, res) {
         if (bonus > 0) {
           tx.set(userRef.collection('history').doc('bonus_' + account), {
             type: 'bonus', amount: bonus,
-            description: wheelPending ? '2x bonus: ilk depozit' : 'Depozit bonusu: 2x balans', createdAt: FieldValue.serverTimestamp()
+            description: wheelPending ? 'PayÇarx bonus: ilk depozitin 2 qatı' : 'Depozit bonusu: 2 qat balans', createdAt: FieldValue.serverTimestamp()
           });
         }
 
@@ -565,16 +489,17 @@ async function pay4bitCallback(req, res) {
       return reply('Request successfully processed');
     }
     return reply('Unknown method', 400);
-  } catch (e) { console.error('[callback]', e); return reply('Server error', 500); }
+  } catch (e) {
+    console.error('[callback]', e);
+    return reply('Server error', 500);
+  }
 }
 app.get('/pay4bit/callback', callbackLimit, pay4bitCallback);
 app.post('/pay4bit/callback', callbackLimit, pay4bitCallback);
 
-/* ═══════════════════════════════════════════════════════════
-   OTP (SMS) — simulyasiya bütün ölkələr üçün
-   ═══════════════════════════════════════════════════════════ */
 const OTP_API_KEY = String(process.env.OTP_API_KEY || '').trim().replace(/^["']+|["']+$/g, '');
 const OTP_BASE = (process.env.OTP_BASE_URL || 'https://api.otpbay.com').trim().replace(/\/+$/, '').replace(/\/v1$/i, '') + '/v1';
+const OTP_LOCALE = process.env.OTP_LOCALE || '';
 const OTP_COOLDOWN_MS = 60 * 1000;
 const OTP_MAX_SENDS_PER_HOUR = 5;
 const OTP_MAX_ATTEMPTS = 5;
@@ -584,31 +509,83 @@ const simHash = (uid, phone, code) => crypto.createHash('sha256').update(`${uid}
 const OTP_IP_MAX_PER_HOUR = Math.max(20, Number(process.env.OTP_IP_MAX_PER_HOUR) || 60);
 const otpIpHits = new Map();
 
-function normPhone(raw) {
+function normPhoneAz(raw) {
   const s = String(raw || '').trim();
   if (!s) return null;
   const plus = s.startsWith('+');
   let d = s.replace(/\D/g, '');
   if (!d) return null;
-  if (!plus && !d.startsWith('00') && d.length <= 12) {
-    // heç bir ölkə kodu yoxdur → AZ default (köhnə davranış)
-    if (d.length === 10 && d.startsWith('0')) d = '994' + d.slice(1);
+  if (!plus) {
+    if (d.startsWith('00')) d = d.slice(2);
+    else if (d.startsWith('994')) { }
+    else if (d.length === 10 && d.startsWith('0')) d = '994' + d.slice(1);
     else if (d.length === 9) d = '994' + d;
+    else return null;
   }
-  if (d.startsWith('00')) d = d.slice(2);
   if (d.length < 10 || d.length > 15) return null;
+  if (d.startsWith('994') && d.length !== 12) return null;
   return '+' + d;
 }
 
+async function otpApi(method, path, body) {
+  try {
+    const r = await fetch(OTP_BASE + path, {
+      method,
+      headers: { Authorization: 'Bearer ' + OTP_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(15000)
+    });
+    const data = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { error: { type: 'network', message: String((e && e.message) || e) } } };
+  }
+}
+function otpFail(res, r) {
+  const map = {
+    0:   [502, 'SMS xidməti ilə əlaqə qurulmadı, bir az sonra yenidən cəhd edin'],
+    401: [502, 'SMS xidməti müvəqqəti əlçatmazdır'],
+    402: [502, 'SMS xidməti müvəqqəti əlçatmazdır'],
+    403: [502, 'SMS xidməti müvəqqəti əlçatmazdır'],
+    404: [400, 'Kodun vaxtı bitib, yenidən göndərin'],
+    409: [409, 'Bu nömrə üçün SMS kanalı aktiv deyil'],
+    400: [400, 'Nömrə və ya kod düzgün deyil'],
+    422: [400, 'Nömrə və ya kod düzgün deyil'],
+    429: [429, 'Çox tez cəhd edildi, bir az gözləyin']
+  };
+  const m = map[r.status] || [502, 'SMS xidməti müvəqqəti əlçatmazdır'];
+  return res.status(m[0]).json({ success: false, error: m[1] });
+}
+function otpIpAllowed(ip) {
+  const now = Date.now();
+  const arr = (otpIpHits.get(ip) || []).filter(t => now - t < 3600000);
+  if (arr.length >= OTP_IP_MAX_PER_HOUR) { otpIpHits.set(ip, arr); return false; }
+  arr.push(now); otpIpHits.set(ip, arr);
+  return true;
+}
+const otpPick = (d, ...keys) => { for (const k of keys) if (d && d[k] !== undefined && d[k] !== null) return d[k]; return undefined; };
+
 async function otpFinalize(uid, phone) {
   const ref = db.collection('users').doc(uid);
-  let out = { phoneVerified: false };
+  let out = { bonus: 0, spinBonus: 0, spins: 0, points: 0 };
   await db.runTransaction(async tx => {
     const snap = await tx.get(ref);
     const u = snap.exists ? snap.data() : {};
-    tx.update(ref, { phone, phoneVerified: true, phoneVerifiedAt: FieldValue.serverTimestamp() });
-    out.phoneVerified = true;
-    out.alreadyVerified = u.phoneVerified === true;
+    const upd = { phone, phoneVerified: true, phoneVerifiedAt: FieldValue.serverTimestamp() };
+    let spins = Math.max(0, Math.floor(Number(u.payWheelSpins) || 0));
+    if (u.phoneSpinGiven !== true) {
+      spins += 1;
+      upd.payWheelSpins = spins;
+      upd.phoneSpinGiven = true;
+      upd.welcomeSpinGiven = true;
+      out.spinBonus = 1;
+      tx.set(ref.collection('history').doc(), {
+        type: 'bonus', amount: 0, description: 'Nömrə doğrulama: 1 PayÇarx', createdAt: FieldValue.serverTimestamp()
+      });
+    }
+    out.spins = spins;
+    out.points = Number(u.points) || 0;
+    tx.update(ref, upd);
   });
   await db.collection('otpSessions').doc(uid).delete().catch(() => {});
   return out;
@@ -617,47 +594,154 @@ async function otpFinalize(uid, phone) {
 async function otpSend(req, res, isResend) {
   try {
     const uid = req.user.uid;
-    const ip = req.realIp || req.ip;
-    const now = Date.now();
-    const arr = (otpIpHits.get(ip) || []).filter(t => now - t < 3600000);
-    if (arr.length >= OTP_IP_MAX_PER_HOUR) return res.status(429).json({ success: false, error: 'Çox cəhd' });
-    arr.push(now); otpIpHits.set(ip, arr);
+    if (!otpIpAllowed(req.realIp || req.ip)) return res.status(429).json({ success: false, error: 'Çox cəhd edildi, sonra yenidən yoxlayın' });
 
     const us = await db.collection('users').doc(uid).get();
     if (!us.exists) return res.status(404).json({ success: false, error: 'İstifadəçi tapılmadı' });
     const u = us.data();
     if (u.phoneVerified === true) return res.json({ success: true, alreadyVerified: true, phone: u.phone || '' });
 
-    const phone = normPhone(u.phone);
+    const phone = normPhoneAz(u.phone);
     if (!phone) return res.status(400).json({ success: false, error: 'Əvvəlcə düzgün nömrə əlavə edin' });
+
+    try {
+      const dup = await db.collection('users').where('phone', '==', phone).limit(10).get();
+      if (dup.docs.some(d => d.id !== uid && d.data().phoneVerified === true)) {
+        return res.status(409).json({ success: false, error: 'Bu nömrə başqa hesabda doğrulanıb' });
+      }
+    } catch (e) { console.warn('[otp] dublikat yoxlaması keçildi:', e && e.message); }
 
     const sref = db.collection('otpSessions').doc(uid);
     const s = (await sref.get()).data() || {};
+    const now = Date.now();
     const sends = (Array.isArray(s.sends) ? s.sends : []).filter(t => Number(t) && now - t < 3600000);
     if (sends.length) {
       const wait = OTP_COOLDOWN_MS - (now - sends[sends.length - 1]);
-      if (wait > 0) return res.status(429).json({ success: false, error: `${Math.ceil(wait/1000)} saniyə sonra`, retryAfter: Math.ceil(wait/1000) });
+      if (wait > 0) return res.status(429).json({ success: false, error: `${Math.ceil(wait / 1000)} saniyə sonra yenidən göndərin`, retryAfter: Math.ceil(wait / 1000) });
     }
-    if (sends.length >= OTP_MAX_SENDS_PER_HOUR) return res.status(429).json({ success: false, error: 'Saatlıq limit' });
+    if (sends.length >= OTP_MAX_SENDS_PER_HOUR) return res.status(429).json({ success: false, error: 'Saatlıq limit dolub, sonra yenidən cəhd edin' });
 
     if (SMS_SIMULATE) {
       const out = await otpFinalize(uid, phone);
-      return res.json({ success: true, simulated: true, verified: true, phone, ...out, cooldown: 0 });
+      return res.json({
+        success: true, simulated: true, verified: true, phone, ...out,
+        completion: 'code', actionUrl: null, channel: 'sms', maskedRecipient: '', cooldown: 0
+      });
     }
-    return res.status(503).json({ success: false, error: 'SMS xidməti hazırda əlçatmazdır' });
+
+    const r = await otpApi('POST', '/verifications', { to: phone });
+    if (!r.ok) return otpFail(res, r);
+
+    const d = r.data || {};
+    const otpId = otpPick(d, 'sid', 'id', 'verification_sid', 'verificationSid', 'otp_id');
+    if (!otpId) { return res.status(502).json({ success: false, error: 'SMS xidməti cavabı başa düşülmədi' }); }
+    const completion = 'code';
+    const actionUrl = null;
+
+    await sref.set({
+      otpId: String(otpId), phone, sends: [...sends, now], attempts: 0,
+      channel: String(otpPick(d, 'channel') || 'sms'), completion, updatedAt: FieldValue.serverTimestamp()
+    });
+    res.json({
+      success: true, completion, actionUrl,
+      channel: String(otpPick(d, 'channel') || 'sms'),
+      maskedRecipient: '',
+      phone, cooldown: OTP_COOLDOWN_MS / 1000
+    });
   } catch (e) {
     console.error('[otp-send]', e);
-    res.status(500).json({ success: false, error: 'Server xətası' });
+    res.status(500).json({ success: false, error: 'Server xətası, bir az sonra yenidən cəhd edin' });
   }
 }
+
+app.get(['/otp/diag', '/api/otp/diag'], async (req, res) => {
+  if (!process.env.DIAG_TOKEN || !safeEq(req.headers['x-diag-token'], process.env.DIAG_TOKEN)) return res.status(404).json({ success: false });
+  if (!otpIpAllowed(req.realIp || req.ip)) return res.status(429).json({ ok: false });
+  const r = await otpApi('GET', '/verifications/VE00000000000000000000000000000000');
+  if (!OTP_API_KEY) return res.json({ ok: false, keyStatus: 'MISSING', base: OTP_BASE });
+  const keyStatus = r.status === 401 ? 'INVALID' : r.status === 0 ? 'UNREACHABLE' : 'VALID';
+  res.json({
+    ok: r.status !== 401 && r.status !== 0,
+    keyStatus, httpStatus: r.status, base: OTP_BASE,
+    keyFromEnv: !!process.env.OTP_API_KEY,
+    simulate: SMS_SIMULATE,
+    providerMessage: (r.data && r.data.error && r.data.error.message) || null
+  });
+});
+
 app.post(['/otp/send', '/api/otp/send'], authUser, (req, res) => otpSend(req, res, false));
 app.post(['/otp/resend', '/api/otp/resend'], authUser, (req, res) => otpSend(req, res, true));
 
-/* ═══════════════════════════════════════════════════════════
-   BUY-CODE (balansdan)
-   ═══════════════════════════════════════════════════════════ */
+app.post(['/otp/verify', '/api/otp/verify'], authUser, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const code = String(req.body.code || '').replace(/\D/g, '');
+    if (code.length < 4 || code.length > 8) return res.status(400).json({ success: false, error: '6 rəqəmli kodu daxil edin' });
+
+    const sref = db.collection('otpSessions').doc(uid);
+    const [ss, us] = await Promise.all([sref.get(), db.collection('users').doc(uid).get()]);
+    const s = ss.data();
+    const u = us.exists ? us.data() : {};
+    if (u.phoneVerified === true) return res.json({ success: true, phone: u.phone || '', bonus: 0, spinBonus: 0, spins: Math.max(0, Math.floor(Number(u.payWheelSpins) || 0)), points: Number(u.points) || 0 });
+    if (!s || (!s.otpId && !s.simulated)) return res.status(400).json({ success: false, error: 'Əvvəlcə kod göndərin' });
+    if ((s.attempts || 0) >= OTP_MAX_ATTEMPTS) return res.status(429).json({ success: false, error: 'Çox yanlış cəhd. Yeni kod göndərin' });
+    if (normPhoneAz(u.phone) !== s.phone) return res.status(409).json({ success: false, error: 'Nömrə dəyişib, yenidən kod göndərin' });
+
+    let matched = false;
+    if (s.simulated) {
+      if (Date.now() > Number(s.expiresAt || 0)) return res.status(400).json({ success: false, error: 'Kodun vaxtı bitib, yenidən göndərin' });
+      const x = Buffer.from(simHash(uid, s.phone, code)), y = Buffer.from(String(s.codeHash || ''));
+      matched = x.length === y.length && crypto.timingSafeEqual(x, y);
+    } else {
+      const r = await otpApi('POST', '/verifications/' + encodeURIComponent(s.otpId) + '/check', { code });
+      if (!r.ok) return otpFail(res, r);
+      matched = !!(r.data && (r.data.valid === true || r.data.approved === true || r.data.matched === true || r.data.status === 'approved'));
+    }
+    if (!matched) {
+      await sref.update({ attempts: FieldValue.increment(1) }).catch(() => {});
+      const left = Math.max(0, OTP_MAX_ATTEMPTS - (s.attempts || 0) - 1);
+      return res.status(400).json({ success: false, error: left ? `Kod yanlışdır (${left} cəhd qaldı)` : 'Kod yanlışdır. Yeni kod göndərin' });
+    }
+
+    const dup = await db.collection('users').where('phone', '==', s.phone).limit(10).get();
+    if (dup.docs.some(d => d.id !== uid && d.data().phoneVerified === true)) return res.status(409).json({ success: false, error: 'Bu nömrə başqa hesabda doğrulanıb' });
+
+    const out = await otpFinalize(uid, s.phone);
+    res.json({ success: true, phone: s.phone, ...out });
+  } catch (e) {
+    console.error('[otp-verify]', e);
+    res.status(500).json({ success: false, error: 'Server xətası, yenidən cəhd edin' });
+  }
+});
+
+app.get(['/otp/status', '/api/otp/status'], authUser, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const s = (await db.collection('otpSessions').doc(uid).get()).data();
+    if (!s || !s.otpId) return res.json({ success: true, status: s && s.simulated ? 'pending' : 'none' });
+    const r = await otpApi('GET', '/verifications/' + encodeURIComponent(s.otpId));
+    if (!r.ok) return otpFail(res, r);
+    const st = r.data && r.data.status;
+    if (st === 'approved') {
+      const us = await db.collection('users').doc(uid).get();
+      if (normPhoneAz(us.data() && us.data().phone) !== s.phone) return res.status(409).json({ success: false, error: 'Nömrə dəyişib, yenidən kod göndərin' });
+      const out = await otpFinalize(uid, s.phone);
+      return res.json({ success: true, status: 'approved', phone: s.phone, ...out });
+    }
+    res.json({ success: true, status: st || 'pending' });
+  } catch (e) {
+    console.error('[otp-status]', e);
+    res.status(502).json({ success: false, error: 'SMS xidməti müvəqqəti əlçatmazdır' });
+  }
+});
+
 const round2g = n => Math.round((Number(n) || 0) * 100) / 100;
 
+/* ═══════════════════════════════════════════════════════════════
+   BUG FIX #1: /buy-code — kod çatdırılması
+   - limit(10) → limit(30): orfan sənədlər sərhədi doldurmasın
+   - RESOURCE_EXHAUSTED → 503 + quota_exceeded
+   ═══════════════════════════════════════════════════════════════ */
 app.post(['/buy-code', '/api/buy-code'], authUser, uidLimit('buy', 12, 60000), async (req, res) => {
   try {
     const platform = req.body.platform === 'chcplay' ? 'chcplay' : 'fastloto';
@@ -690,7 +774,7 @@ app.post(['/buy-code', '/api/buy-code'], authUser, uidLimit('buy', 12, 60000), a
       tx.update(poolDoc.ref, {
         status: 'used', usedByUid: uid, usedByUniqueId: String(u.uniqueId || ''), usedAt: FieldValue.serverTimestamp()
       });
-      tx.update(userRef, { balance: nb });
+      tx.update(userRef, { balance: nb, spendRef: 'p:' + poolDoc.id });
       tx.set(userRef.collection('codes').doc('pool_' + poolDoc.id), {
         code: codeStr, platform, amount, source: 'pool', status: 'active', createdAt: FieldValue.serverTimestamp()
       });
@@ -708,14 +792,16 @@ app.post(['/buy-code', '/api/buy-code'], authUser, uidLimit('buy', 12, 60000), a
     if (m === 'balance') return res.status(409).json({ success: false, error: 'balance' });
     if (m === 'banned') return res.status(403).json({ success: false, error: 'banned' });
     if (m === 'user_not_found') return res.status(404).json({ success: false, error: 'user_not_found' });
+    const code = String((e && e.code) || '');
+    if (code === '8' || /RESOURCE_EXHAUSTED|Quota exceeded/i.test(m || '')) {
+      console.error('[buy-code] Firestore kvotası dolub');
+      return res.status(503).json({ success: false, error: 'quota_exceeded', retryAfter: 3600 });
+    }
     console.error('[buy-code]', e);
     return res.status(500).json({ success: false, error: 'server_error' });
   }
 });
 
-/* ═══════════════════════════════════════════════════════════
-   ADMIN GUARD
-   ═══════════════════════════════════════════════════════════ */
 const SUPER_ADMIN_UID = process.env.SUPER_ADMIN_UID || 'dIxZVPfOLIPZW0xqtcTeg7JXRnN2';
 async function requireFullAdmin(req, res, next) {
   try {
@@ -728,7 +814,13 @@ async function requireFullAdmin(req, res, next) {
     next();
   } catch (e) { console.error('[admin-auth]', e); res.status(500).json({ success: false, error: 'server_error' }); }
 }
-
+function adminErr(res, e, tag) {
+  const m = e && e.message;
+  if (m === 'user_not_found') return res.status(404).json({ success: false, error: 'İstifadəçi tapılmadı' });
+  if (m === 'negative') return res.status(400).json({ success: false, error: 'Balans mənfi ola bilməz' });
+  console.error(tag, e);
+  return res.status(500).json({ success: false, error: 'server_error' });
+}
 app.post(['/admin/adjust-balance', '/api/admin/adjust-balance'], authUser, uidLimit('adm', 60, 60000), requireFullAdmin, async (req, res) => {
   try {
     const target = String(req.body.uid || '').trim();
@@ -748,35 +840,44 @@ app.post(['/admin/adjust-balance', '/api/admin/adjust-balance'], authUser, uidLi
       });
     });
     res.json({ success: true, balance: nb });
-  } catch (e) {
-    const m = e && e.message;
-    if (m === 'user_not_found') return res.status(404).json({ success: false, error: 'İstifadəçi tapılmadı' });
-    if (m === 'negative') return res.status(400).json({ success: false, error: 'Balans mənfi ola bilməz' });
-    res.status(500).json({ success: false, error: 'server_error' });
-  }
+  } catch (e) { adminErr(res, e, '[admin-adjust-balance]'); }
+});
+app.post(['/admin/give-spins', '/api/admin/give-spins'], authUser, uidLimit('adm', 60, 60000), requireFullAdmin, async (req, res) => {
+  try {
+    const target = String(req.body.uid || '').trim();
+    const n = Math.floor(Number(req.body.count));
+    if (!target || target.length > 128 || !(n >= 1 && n <= 100)) return res.status(400).json({ success: false, error: '1–100 arası yazın' });
+    const ref = db.collection('users').doc(target);
+    let spins = 0;
+    await db.runTransaction(async tx => {
+      const s = await tx.get(ref);
+      if (!s.exists) throw new Error('user_not_found');
+      spins = Math.max(0, Math.floor(Number(s.data().payWheelSpins) || 0)) + n;
+      tx.update(ref, { payWheelSpins: spins });
+    });
+    res.json({ success: true, spins });
+  } catch (e) { adminErr(res, e, '[admin-give-spins]'); }
 });
 
-/* ═══════════════════════════════════════════════════════════
-   YENİ ROUTE-LAR
-   ═══════════════════════════════════════════════════════════ */
-require('./p2p-route')(app, { admin, db, DB_ANALYTICS, authUser, uidLimit, callbackLimit, region, round2g, FieldValue, requireFullAdmin });
-require('./gift-route')(app, { admin, db, authUser, uidLimit, region });
 require('./betatransfer-route')(app, { admin, db, authUser, uidLimit, callbackLimit, genYeKod, campaignActive });
+require('./spin-route')(app, { admin, db });
+require('./email-verify-route')(app, { admin, db });
 require('./password-reset-route')(app, { admin, db });
 require('./payouts-route')(app, { db });
 
-/* ═══════════════════════════════════════════════════════════
-   HEALTH
-   ═══════════════════════════════════════════════════════════ */
+function withTimeout(promise, ms) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout ' + ms + 'ms')), ms))]);
+}
 async function fsPing() {
   const t = Date.now();
   await withTimeout(db.collection('_health').doc('ping').get(), 25000);
   return Date.now() - t;
 }
 app.get(['/health/deep', '/api/health/deep'], async (req, res) => {
-  try { res.json({ ok: true, firestoreMs: await fsPing(), p2: !!dbBasket, p3: !!dbAnalytics }); }
+  try { res.json({ ok: true, firestoreMs: await fsPing(), p2: !!db2 }); }
   catch (e) { res.status(503).json({ ok: false, error: String(e && e.message || e) }); }
 });
+
 app.get(['/health', '/api/health'], (req, res) => res.json({ ok: true }));
 app.get('/', (req, res) => res.json({ ok: true }));
 
@@ -785,20 +886,16 @@ app.use((err, req, res, next) => { console.error('[express]', err); res.status(5
 process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
 process.on('uncaughtException', e => console.error('[uncaughtException]', e));
 
-const PORT = process.env.PORT || 10000;
-const server = app.listen(PORT, '0.0.0.0', () => console.log(`Server ${PORT} portunda işləyir`));
-server.keepAliveTimeout = 120 * 1000;
-server.headersTimeout = 125 * 1000;
-fsPing().then(ms => console.log('[warmup] Firestore hazırdır,', ms, 'ms')).catch(e => console.warn('[warmup] Firestore:', e.message));
-
-/* Basket sync — campaign kodları 2-ci layihəyə */
+/* ═══════════════════════════════════════════════════════════════
+   BUG FIX #2: Basket sync — 5 dəq → 15 dəq, 1000 → 300
+   ═══════════════════════════════════════════════════════════════ */
 const BASKET_MAX = 300;
 let basketBusy = false, basketLastErr = '';
 async function syncCampaignBasket() {
-  if (!dbBasket || basketBusy) return;
+  if (!db2 || basketBusy) return;
   basketBusy = true;
   try {
-    const ref2 = dbBasket.collection('public').doc('campaignBasket');
+    const ref2 = db2.collection('public').doc('campaignBasket');
     const snap2 = await withTimeout(ref2.get(), 30000);
     const prev = snap2.exists ? (snap2.data() || {}) : {};
     const lastMs = Number(prev.syncedMs) || 0;
@@ -829,4 +926,27 @@ async function syncCampaignBasket() {
     basketLastErr = m;
   } finally { basketBusy = false; }
 }
-if (dbBasket) { setTimeout(syncCampaignBasket, 60000); setInterval(syncCampaignBasket, 15 * 60 * 1000); }
+if (db2) { setTimeout(syncCampaignBasket, 60000); setInterval(syncCampaignBasket, 15 * 60 * 1000); }
+
+const PORT = process.env.PORT || 10000;
+const server = app.listen(PORT, '0.0.0.0', () => console.log(`Server ${PORT} portunda işləyir`));
+server.keepAliveTimeout = 120 * 1000;
+server.headersTimeout = 125 * 1000;
+
+fsPing().then(ms => console.log('[warmup] Firestore hazırdır,', ms, 'ms')).catch(e => console.warn('[warmup] Firestore:', e.message));
+
+let fsFails = 0;
+setInterval(() => {
+  fsPing().then(ms => { if (fsFails) console.log('[keepwarm] Firestore bərpa olundu,', ms, 'ms'); fsFails = 0; })
+    .catch(e => {
+      const msg = String(e && e.message || e);
+      if (/RESOURCE_EXHAUSTED|Quota/i.test(msg)) {
+        console.error('[QUOTA] Firestore gündəlik limiti dolub.');
+        return;
+      }
+      fsFails++;
+      if (fsFails >= 3) { console.error('[watchdog] Firestore 3 dəfə cavab vermədi'); setTimeout(() => process.exit(1), 500); }
+    });
+}, 15 * 60 * 1000);
+
+/* BUG FIX #3: Self-ping SİLİNDİ (Render TOS-a ziddir) */
